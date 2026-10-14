@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/unicitynetwork/bft-core/gettrustbase"
 	"github.com/unicitynetwork/bft-go-base/types"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -40,6 +41,9 @@ type Server struct {
 	inflightN  int
 	baseCtx    context.Context // cancelled to cut residual work at the shutdown deadline
 	baseCancel context.CancelFunc
+	utbServer  *gettrustbase.Server
+	utbNetwork types.NetworkID
+	utbGenesis uint64
 }
 
 // Service represents the business logic service interface
@@ -66,7 +70,7 @@ type TrustBaseService interface {
 }
 
 // NewServer creates a new gateway server
-func NewServer(cfg *config.Config, logger *logger.Logger, service Service) *Server {
+func NewServer(cfg *config.Config, logger *logger.Logger, service Service, opts ...Option) *Server {
 	// Configure Gin
 	if cfg.Logging.Level == "debug" {
 		gin.SetMode(gin.DebugMode)
@@ -97,6 +101,9 @@ func NewServer(cfg *config.Config, logger *logger.Logger, service Service) *Serv
 	server.baseCtx, server.baseCancel = context.WithCancel(context.Background())
 
 	// Setup routes
+	for _, opt := range opts {
+		opt(server)
+	}
 	server.setupRoutes()
 	server.setupJSONRPCHandlers()
 
@@ -142,8 +149,12 @@ func (s *Server) setupRoutes() {
 	s.router.GET("/health", s.handleHealth)
 	s.router.GET("/health/leader", s.handleLeaderHealth)
 	s.router.GET("/metrics", gin.WrapH(promhttp.Handler()))
-	s.router.PUT("/api/v1/trustbases", s.handlePutTrustBase)
-	s.router.GET("/api/v1/trustbases", getTrustBaseHandler(s.logger, s.service))
+	if s.utbServer != nil {
+		s.router.GET("/api/v1/trustbases", getTrustBaseHistoryHandler(s.logger, s.utbServer, s.utbNetwork, s.utbGenesis))
+	} else {
+		s.router.PUT("/api/v1/trustbases", s.handlePutTrustBase)
+		s.router.GET("/api/v1/trustbases", getTrustBaseHandler(s.logger, s.service))
+	}
 
 	// JSON-RPC endpoint
 	s.router.POST("/", gin.WrapH(s.rpcServer))

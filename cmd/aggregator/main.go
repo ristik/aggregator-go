@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/unicitynetwork/bft-core/gettrustbase"
 	"github.com/unicitynetwork/bft-go-base/types"
 
 	"github.com/unicitynetwork/aggregator-go/internal/bft/rest"
@@ -28,6 +29,7 @@ import (
 	"github.com/unicitynetwork/aggregator-go/internal/storage"
 	"github.com/unicitynetwork/aggregator-go/internal/storage/interfaces"
 	"github.com/unicitynetwork/aggregator-go/internal/trustbase"
+	"github.com/unicitynetwork/aggregator-go/internal/utb"
 	"github.com/unicitynetwork/aggregator-go/pkg/api"
 )
 
@@ -188,7 +190,25 @@ func main() {
 
 	// Create trust base manager if BFT is enabled, otherwise use trust base store as the provider
 	var trustBaseProvider interfaces.TrustBaseProvider
-	if cfg.BFT.Enabled {
+	var gatewayOpts []gateway.Option
+	if cfg.BFT.Enabled && cfg.BFT.UTB.Enabled() {
+		history, err := utb.Open(cfg.BFT.UTB.BundleFile, cfg.BFT.UTB.GenesisFile, cfg.BFT.UTB.GenesisID, cfg.BFT.UTB.EntriesDB)
+		if err != nil {
+			log.WithComponent("main").Error("Failed to open the signed trust-base history", "error", err.Error())
+			gracefulExit(asyncLogger, 1)
+		}
+		defer history.Close()
+		historyServer, err := gettrustbase.NewServer(history.Source(), gettrustbase.Config{})
+		if err != nil {
+			log.WithComponent("main").Error("Failed to create the trust-base history server", "error", err.Error())
+			gracefulExit(asyncLogger, 1)
+		}
+		gatewayOpts = append(gatewayOpts, gateway.WithTrustBaseHistory(historyServer, history.Network(), history.GenesisEpoch()))
+		tip := history.Tip()
+		log.WithComponent("main").Info("Signed trust-base history loaded", "genesisEpoch", history.GenesisEpoch(), "tipEpoch", tip.Epoch,
+			"tipEntryId", fmt.Sprintf("%x", tip.EntryID))
+		trustBaseProvider = history
+	} else if cfg.BFT.Enabled {
 		bftRestClient := rest.NewBFTRestClient(cfg.BFT.RPCAddress)
 		trustBaseProvider = trustbase.NewTrustBaseManager(log, trustBaseStore, bftRestClient, trustBaseValidator)
 	} else {
@@ -266,7 +286,7 @@ func main() {
 	}
 
 	// Initialize gateway server
-	server := gateway.NewServer(cfg, log, aggregatorService)
+	server := gateway.NewServer(cfg, log, aggregatorService, gatewayOpts...)
 	server.SetLongPoll(longPoll)
 
 	// get_inclusion_proofs.v1: served from the retained-view catalog, or explicitly
