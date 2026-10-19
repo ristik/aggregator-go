@@ -178,6 +178,9 @@ func proofIsIncluded(r *api.GetInclusionProofResponseV2) bool {
 func (s *Server) handleGetNoDeletionProof(ctx context.Context, params json.RawMessage) (interface{}, *jsonrpc.Error) {
 	// Call service
 	response, err := s.service.GetNoDeletionProof(ctx)
+	if errors.Is(err, api.ErrNotSupported) {
+		return nil, jsonrpc.NewError(jsonrpc.MethodNotFoundCode, "get_no_deletion_proof is not supported by this aggregator", nil)
+	}
 	if err != nil {
 		s.logger.WithContext(ctx).Error("Failed to get no-deletion proof", "error", err.Error())
 		return nil, jsonrpc.NewError(jsonrpc.InternalErrorCode, "Failed to get no-deletion proof", err.Error())

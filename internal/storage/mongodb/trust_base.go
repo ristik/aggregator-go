@@ -129,19 +129,23 @@ func (s *TrustBaseStorage) GetAll(ctx context.Context) ([]*types.RootTrustBaseV1
 	return result, nil
 }
 
-// CreateIndexes creates necessary indexes for the trust base collection.
-func (s *TrustBaseStorage) CreateIndexes(ctx context.Context) error {
-	indexes := []mongo.IndexModel{
+// trustBaseIndexModels is the index set of the trust base collection. Every key is a field name of
+// the stored document (see TrustBaseBSON): an index on a name that is not stored indexes nothing.
+func trustBaseIndexModels() []mongo.IndexModel {
+	return []mongo.IndexModel{
 		{
 			Keys:    bson.D{{Key: "epoch", Value: 1}},
 			Options: options.Index().SetUnique(true),
 		},
 		{
-			Keys: bson.D{{Key: "epochStart", Value: 1}},
+			Keys: bson.D{{Key: "epochStartRound", Value: 1}},
 		},
 	}
-	_, err := s.collection.Indexes().CreateMany(ctx, indexes)
-	if err != nil {
+}
+
+// CreateIndexes creates necessary indexes for the trust base collection.
+func (s *TrustBaseStorage) CreateIndexes(ctx context.Context) error {
+	if _, err := s.collection.Indexes().CreateMany(ctx, trustBaseIndexModels()); err != nil {
 		return fmt.Errorf("failed to create trust base indexes: %w", err)
 	}
 	return nil

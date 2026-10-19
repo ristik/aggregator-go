@@ -114,6 +114,7 @@ func setupMongoDBAndAggregator(t *testing.T, ctx context.Context) (string, func(
 	os.Setenv("LOG_LEVEL", "warn")
 	os.Setenv("DISABLE_HIGH_AVAILABILITY", "true")
 	os.Setenv("BFT_ENABLED", "false")
+	os.Setenv("BFT_ALLOW_STUB", "true")
 
 	// Load configuration
 	cfg, err := config.Load()
@@ -1486,5 +1487,19 @@ func TestCertificationRequestClearsPendingMarkOverProcessedDuplicate(t *testing.
 			require.ErrorIs(t, err, interfaces.ErrDuplicateKey)
 			require.NotEqual(t, api.ProofStatusPending, rm.ProofStatus(req.StateID), "nothing is queued, the hint must not stay pending")
 		})
+	}
+}
+
+// The aggregator produces no no-deletion proof and says so, in both modes; there is no placeholder.
+func TestGetNoDeletionProofIsNotSupported(t *testing.T) {
+	for name, svc := range map[string]interface {
+		GetNoDeletionProof(context.Context) (*api.GetNoDeletionProofResponse, error)
+	}{
+		"aggregator": &AggregatorService{},
+		"parent":     &ParentAggregatorService{},
+	} {
+		resp, err := svc.GetNoDeletionProof(context.Background())
+		require.Nil(t, resp, name)
+		require.ErrorIs(t, err, api.ErrNotSupported, name)
 	}
 }

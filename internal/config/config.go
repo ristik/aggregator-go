@@ -537,6 +537,11 @@ func Load() (*Config, error) {
 			EntriesDB:   getEnvOrDefault("UTB_ENTRIES_DB", "utb-entries.db"),
 		},
 	}
+	if !config.BFT.Enabled && !getEnvBoolOrDefault("BFT_ALLOW_STUB", false) {
+		// the stub certifies every round itself with synthetic, unsigned certificates: no real
+		// consensus. A deployment must never run it by accident (a typo in BFT_ENABLED).
+		return nil, errors.New("BFT_ENABLED=false selects the BFT stub, which issues synthetic unsigned certificates and is for tests only; set BFT_ALLOW_STUB=true to run it knowingly")
+	}
 	if config.BFT.Enabled {
 		config.BFT.KeyConf = config.Signing.KeyConf
 		if err := loadConf(getEnvOrDefault("BFT_SHARD_CONF_FILE", "bft-config/shard-conf-7_0.json"), &config.BFT.ShardConf); err != nil {

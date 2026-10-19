@@ -230,6 +230,10 @@ type RootShardInclusionProof struct {
 	BlockNumber        uint64                   `json:"blockNumber,omitempty"`
 }
 
+// ErrNotSupported is returned for a method this aggregator does not implement. It is never
+// answered with a placeholder result: a caller that gets a proof must be able to rely on it.
+var ErrNotSupported = errors.New("not supported")
+
 // GetNoDeletionProofResponse represents the get_no_deletion_proof JSON-RPC response
 type GetNoDeletionProofResponse struct {
 	NoDeletionProof *NoDeletionProof `json:"noDeletionProof"`

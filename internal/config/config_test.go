@@ -291,6 +291,7 @@ func TestConfigValidateSMTBackend(t *testing.T) {
 
 func TestMongoWriteConcernEnvDefaults(t *testing.T) {
 	t.Setenv("BFT_ENABLED", "false")
+	t.Setenv("BFT_ALLOW_STUB", "true")
 	t.Setenv("DISABLE_HIGH_AVAILABILITY", "true")
 	t.Setenv("MONGODB_WRITE_CONCERN", "")
 	t.Setenv("MONGODB_WRITE_JOURNAL", "")
@@ -309,6 +310,7 @@ func TestMongoWriteConcernEnvDefaults(t *testing.T) {
 
 func TestCollectMiniBatchSizeEnv(t *testing.T) {
 	t.Setenv("BFT_ENABLED", "false")
+	t.Setenv("BFT_ALLOW_STUB", "true")
 	t.Setenv("DISABLE_HIGH_AVAILABILITY", "true")
 
 	cfg, err := Load()
@@ -331,6 +333,7 @@ func TestCollectMiniBatchSizeEnv(t *testing.T) {
 
 func TestBlockSyncIntervalEnv(t *testing.T) {
 	t.Setenv("BFT_ENABLED", "false")
+	t.Setenv("BFT_ALLOW_STUB", "true")
 	t.Setenv("BLOCK_SYNC_INTERVAL", "250ms")
 
 	cfg, err := Load()
@@ -344,6 +347,7 @@ func TestBlockSyncIntervalEnv(t *testing.T) {
 
 func TestMongoWriteConcernEnvOverrides(t *testing.T) {
 	t.Setenv("BFT_ENABLED", "false")
+	t.Setenv("BFT_ALLOW_STUB", "true")
 	t.Setenv("DISABLE_HIGH_AVAILABILITY", "true")
 	t.Setenv("MONGODB_WRITE_CONCERN", "1")
 	t.Setenv("MONGODB_WRITE_JOURNAL", "false")
@@ -362,6 +366,7 @@ func TestMongoWriteConcernEnvOverrides(t *testing.T) {
 
 func TestSMTEnvParsing(t *testing.T) {
 	t.Setenv("BFT_ENABLED", "false")
+	t.Setenv("BFT_ALLOW_STUB", "true")
 	t.Setenv("DISABLE_HIGH_AVAILABILITY", "true")
 	t.Setenv("SMT_BACKEND", "rocksdb")
 	t.Setenv("SMT_DISK_PATH", "/tmp/aggr-smt")
@@ -400,6 +405,7 @@ func TestRedisSentinelEnvParsing(t *testing.T) {
 	t.Setenv("REDIS_PASSWORD", "datapass")
 
 	t.Setenv("BFT_ENABLED", "false")
+	t.Setenv("BFT_ALLOW_STUB", "true")
 	t.Setenv("DISABLE_HIGH_AVAILABILITY", "true")
 
 	cfg, err := Load()
@@ -427,6 +433,7 @@ func TestRedisSentinelEnvParsing(t *testing.T) {
 
 func TestRedisSentinelDefaults(t *testing.T) {
 	t.Setenv("BFT_ENABLED", "false")
+	t.Setenv("BFT_ALLOW_STUB", "true")
 	t.Setenv("DISABLE_HIGH_AVAILABILITY", "true")
 
 	cfg, err := Load()
@@ -493,5 +500,26 @@ func TestConfigValidateRefusesAnotherPartition(t *testing.T) {
 	cfg.BFT.ShardConf.PartitionID = 0
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("partition 0 accepted")
+	}
+}
+
+// BFT_ENABLED=false selects the BFT stub (synthetic, unsigned certificates): a deployment must not get
+// it by accident, so it needs the explicit BFT_ALLOW_STUB.
+func TestTheBFTStubNeedsAnExplicitAllow(t *testing.T) {
+	t.Setenv("BFT_ENABLED", "false")
+	t.Setenv("DISABLE_HIGH_AVAILABILITY", "true")
+
+	t.Setenv("BFT_ALLOW_STUB", "")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "BFT_ALLOW_STUB") {
+		t.Fatalf("Load without BFT_ALLOW_STUB = %v, want the stub refusal", err)
+	}
+	t.Setenv("BFT_ALLOW_STUB", "false")
+	if _, err := Load(); err == nil {
+		t.Fatal("BFT_ALLOW_STUB=false must not allow the stub")
+	}
+	t.Setenv("BFT_ALLOW_STUB", "true")
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load with BFT_ALLOW_STUB=true returned error: %v", err)
 	}
 }

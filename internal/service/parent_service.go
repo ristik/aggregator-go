@@ -247,9 +247,9 @@ func (pas *ParentAggregatorService) GetInclusionProofV2(ctx context.Context, req
 	return nil, fmt.Errorf("get_inclusion_proof.v2 is not supported in parent mode - use get_shard_proof instead")
 }
 
-// GetNoDeletionProof - TODO: implement
+// GetNoDeletionProof is not implemented (see AggregatorService.GetNoDeletionProof).
 func (pas *ParentAggregatorService) GetNoDeletionProof(ctx context.Context) (*api.GetNoDeletionProofResponse, error) {
-	return nil, fmt.Errorf("get_no_deletion_proof not implemented yet in parent mode")
+	return nil, fmt.Errorf("get_no_deletion_proof: %w", api.ErrNotSupported)
 }
 
 // GetBlockHeight retrieves the current parent block height

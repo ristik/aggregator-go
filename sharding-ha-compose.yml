@@ -322,6 +322,7 @@ services:
       BATCH_LIMIT: "1000"
       SIGNING_KEY_FILE: "/app/bft-config/aggregator/keys.json"
       BFT_ENABLED: "false"
+      BFT_ALLOW_STUB: "true" # test composition: the stub issues synthetic unsigned certificates
       BFT_SHARD_CONF_FILE: "/app/bft-config/shard-conf-7_0.json"
       BFT_TRUST_BASE_FILES: "/app/bft-config/trust-base.json"
       BFT_RPC_ADDRESS: "http://127.0.0.1:8002"

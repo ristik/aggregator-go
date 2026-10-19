@@ -524,15 +524,10 @@ func proofBundleBlockNumber(mode config.ShardingMode, block *models.Block) (uint
 	return block.ParentBlockNumber, nil
 }
 
-// GetNoDeletionProof retrieves the global no-deletion proof
+// GetNoDeletionProof is not implemented: the aggregator produces no no-deletion proof, and says
+// so (it used to return a fixed placeholder, which a client could mistake for a proof).
 func (as *AggregatorService) GetNoDeletionProof(ctx context.Context) (*api.GetNoDeletionProofResponse, error) {
-	// TODO: Implement no-deletion proof generation
-	// For now, return a placeholder
-	proof := api.NewNoDeletionProof(api.HexBytes("mock_no_deletion_proof"))
-
-	return &api.GetNoDeletionProofResponse{
-		NoDeletionProof: proof,
-	}, nil
+	return nil, fmt.Errorf("get_no_deletion_proof: %w", api.ErrNotSupported)
 }
 
 // GetBlockHeight retrieves the current block height

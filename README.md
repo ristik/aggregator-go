@@ -261,7 +261,8 @@ make run
 
 | Variable                            | Description                                                                         | Default                          |
 |-------------------------------------|-------------------------------------------------------------------------------------|----------------------------------|
-| `BFT_ENABLED`                       | Enables or disables the BFT client integration.                                     | `true`                           |
+| `BFT_ENABLED`                       | Enables or disables the BFT client integration. `false` selects the BFT stub (synthetic unsigned certificates, tests only) and needs `BFT_ALLOW_STUB=true`. | `true`                           |
+| `BFT_ALLOW_STUB`                    | Allows `BFT_ENABLED=false`. The stub is never a deployment configuration.           | `false`                          |
 | `BFT_ADDRESS`                       | The libp2p multiaddress for the BFT client to listen on.                            | `/ip4/0.0.0.0/tcp/9000`          |
 | `BFT_RPC_ADDRESS`                   | The BFT node's RPC API address.                                                     | `http://127.0.0.1:8002`          |
 | `BFT_ANNOUNCE_ADDRESSES`            | Comma-separated list of public callback multi-addresses to announce to other peers. | `""`                             |
@@ -550,7 +551,7 @@ Retrieve all certification requests included in a specific block.
 ```
 
 #### `get_no_deletion_proof`
-Retrieve the global no-deletion proof for the aggregator data structure. **Not implemented yet** — in standalone/child mode this returns a fixed placeholder proof, and in parent mode it returns an error.
+**Not supported.** The aggregator produces no no-deletion proof and answers the method with the JSON-RPC error `-32601` ("get_no_deletion_proof is not supported by this aggregator") in every mode; it never returns a placeholder result (earlier versions returned a fixed value that a client could mistake for a proof).
 
 **Request:**
 ```json
@@ -566,17 +567,13 @@ Retrieve the global no-deletion proof for the aggregator data structure. **Not i
 ```json
 {
   "jsonrpc": "2.0",
-  "result": {
-    "noDeletionProof": {
-      "proof": "6d6f636b5f6e6f5f64656c6574696f6e5f70726f6f66",
-      "createdAt": "1734435600000"
-    }
+  "error": {
+    "code": -32601,
+    "message": "get_no_deletion_proof is not supported by this aggregator"
   },
   "id": 6
 }
 ```
-
-### HTTP Endpoints
 
 #### `GET /health`
 Returns the health status and role of the service.
