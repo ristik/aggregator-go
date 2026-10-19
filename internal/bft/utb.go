@@ -2,7 +2,6 @@ package bft
 
 import (
 	"context"
-	"crypto"
 	"errors"
 	"fmt"
 
@@ -11,6 +10,7 @@ import (
 	"github.com/unicitynetwork/bft-core/network/protocol/certification"
 	"github.com/unicitynetwork/bft-go-base/types"
 
+	"github.com/unicitynetwork/aggregator-go/internal/storage/interfaces"
 	"github.com/unicitynetwork/aggregator-go/internal/utb"
 )
 
@@ -19,63 +19,31 @@ type utbHistoryProvider interface {
 	UTBHistory() *utb.History
 }
 
-// handleCertificationResponseV2 authenticates and appends the attached signed entries, catches up when they do not follow the held tip, and then
-// handles the certificate exactly as a legacy response: the entries are an authority update independent of the response's status, a valid entry never
-// turns a rejection into an acceptance and an invalid one never affects the certificate.
-func (c *BFTClientImpl) handleCertificationResponseV2(ctx context.Context, cr *certification.CertificationResponseV2) error {
-	if err := cr.IsValid(); err != nil {
-		return fmt.Errorf("invalid CertificationResponseV2: %w", err)
+// ErrNextEpochNotFetched: the roots did not serve the entry after the held tip.
+var ErrNextEpochNotFetched = errors.New("the next trust-base entry could not be fetched")
+
+// utbAuthority makes the held history the authority source of the shared UC authenticator: local reads of held entries only.
+type utbAuthority struct{ h *utb.History }
+
+func (a utbAuthority) GetAdmittedAuthority(_ context.Context, epoch uint64) (types.RootTrustBase, bool, error) {
+	e, err := a.h.Committee(epoch)
+	if errors.Is(err, utb.ErrUnknownEpoch) {
+		return nil, false, nil
 	}
-	if c.utb != nil && len(cr.TrustBaseUpdates) > 0 {
-		updates := make([][]byte, len(cr.TrustBaseUpdates))
-		for i, u := range cr.TrustBaseUpdates {
-			updates[i] = u
-		}
-		added, gap, err := c.utb.Ingest(updates)
-		switch {
-		case err != nil:
-			c.logger.WithContext(ctx).Warn("dropping an invalid trust-base update", "error", err.Error())
-		case gap:
-			c.logger.WithContext(ctx).Info("trust-base gap in certification response", "added", added, "tip", c.utb.Tip().Epoch)
-			c.catchUpTrustBase(ctx)
-		case added > 0:
-			c.logger.WithContext(ctx).Info("trust-base entries appended from certification response", "added", added, "tip", c.utb.Tip().Epoch)
-		}
+	if err != nil {
+		return nil, false, err
 	}
-	return c.handleCertificationResponse(ctx, cr.Response())
+	return e, true, nil
 }
 
-// verifyUC verifies the certificate under its own epoch. With the signed history: the held entry of the seal's epoch, its strict weighted quorum and
-// activation interval; an unknown epoch triggers one bounded catch-up and one retry, and nothing advances while the authority stays unknown.
-func (c *BFTClientImpl) verifyUC(ctx context.Context, uc *types.UnicityCertificate) error {
-	if c.utb == nil {
-		tb, err := c.trustBaseStore.GetByEpoch(ctx, uc.GetRootEpoch())
-		if err != nil {
-			return fmt.Errorf("failed to load trust base for epoch %d: %w", uc.GetRootEpoch(), err)
-		}
-		return uc.Verify(tb, crypto.SHA256, c.partitionID, c.shardID, nil)
-	}
-	err := c.utb.VerifyUC(uc, c.partitionID, c.shardID)
-	if errors.Is(err, utb.ErrUnknownEpoch) {
-		c.catchUpTrustBase(ctx)
-		err = c.utb.VerifyUC(uc, c.partitionID, c.shardID)
-	}
-	return err
-}
+// utbIntake is the intake view of the held history: the admitted root peer set derives from it and the single catch-up worker extends it, by peer
+// GetTrustBase from the held tip, never by root HTTP and never from an epoch advertised by a message.
+type utbIntake struct{ c *BFTClientImpl }
 
-// trustBase is the committee of an epoch, used for routing. With the signed history an unknown epoch triggers one bounded catch-up.
-func (c *BFTClientImpl) trustBase(ctx context.Context, epoch uint64) (types.RootTrustBase, error) {
-	if c.utb == nil {
-		tb, err := c.trustBaseStore.GetByEpoch(ctx, epoch)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load trust base for epoch %d: %w", epoch, err)
-		}
-		return tb, nil
-	}
-	e, err := c.utb.Committee(epoch)
+func (i utbIntake) GetByEpochLocal(_ context.Context, epoch uint64) (types.RootTrustBase, error) {
+	e, err := i.c.utb.Committee(epoch)
 	if errors.Is(err, utb.ErrUnknownEpoch) {
-		c.catchUpTrustBase(ctx)
-		e, err = c.utb.Committee(epoch)
+		return nil, interfaces.ErrTrustBaseNotFound
 	}
 	if err != nil {
 		return nil, err
@@ -83,53 +51,49 @@ func (c *BFTClientImpl) trustBase(ctx context.Context, epoch uint64) (types.Root
 	return e, nil
 }
 
-// newestCommittee is the latest held entry when it is newer than epoch: its committee is added to (never substituted for) the routing targets, because a
-// held future entry does not mean that committee is already the one certifying.
-func (c *BFTClientImpl) newestCommittee(epoch uint64) types.RootTrustBase {
-	if c.utb == nil {
-		return nil
+func (i utbIntake) Head(context.Context) (uint64, error) { return i.c.utb.Tip().Epoch, nil }
+
+// AdmitNext fetches the entry after the held tip from the roots (newest held committee first), authenticated by the store from the tip.
+func (i utbIntake) AdmitNext(ctx context.Context) (uint64, error) {
+	c := i.c
+	next := c.utb.Tip().Epoch + 1
+	fetcher, peers := c.utbFetcher(), c.utbPeers()
+	if fetcher == nil || len(peers) == 0 {
+		return 0, fmt.Errorf("%w: no peer to ask", ErrNextEpochNotFetched)
 	}
+	c.logger.WithContext(ctx).Info("trust-base catch-up started", "from", next, "peers", len(peers))
+	added, err := c.utb.CatchUpTo(ctx, &loggingFetcher{f: fetcher, c: c}, peers, next)
 	tip := c.utb.Tip().Epoch
-	if tip <= epoch {
-		return nil
-	}
-	e, err := c.utb.Committee(tip)
 	if err != nil {
-		return nil
+		c.logger.WithContext(ctx).Warn("trust-base catch-up finished", "added", added, "tip", tip, "error", err.Error())
+	} else {
+		c.logger.WithContext(ctx).Info("trust-base catch-up finished", "added", added, "tip", tip)
 	}
-	return e
+	if tip < next {
+		if err == nil {
+			err = errors.New("no root served it")
+		}
+		return 0, fmt.Errorf("%w: epoch %d: %w", ErrNextEpochNotFetched, next, err)
+	}
+	return next, nil
 }
 
-// withNewestCommittee extends the selected root peers of the certificate's epoch with the newest held committee's.
-func (c *BFTClientImpl) withNewestCommittee(ids peer.IDSlice, epoch uint64, pick func(types.RootTrustBase) (peer.IDSlice, error)) peer.IDSlice {
-	tb := c.newestCommittee(epoch)
-	if tb == nil {
-		return ids
+// utbFetcher is the GetTrustBase client on this node's libp2p peer (or the injected one).
+func (c *BFTClientImpl) utbFetcher() gettrustbase.Fetcher {
+	if c.trustBaseFetcher != nil {
+		return c.trustBaseFetcher
 	}
-	more, err := pick(tb)
-	if err != nil {
-		c.logger.Warn("selecting root nodes of the newest committee", "error", err.Error())
-		return ids
-	}
-	return unionPeers(ids, more)
-}
-
-// catchUpTrustBase fetches the missing entries after the held tip over the roots' GetTrustBase protocol (never the root HTTP endpoint), asking the
-// newest held committee first and then every older one.
-func (c *BFTClientImpl) catchUpTrustBase(ctx context.Context) {
 	c.mu.Lock()
 	self := c.peer
 	c.mu.Unlock()
-	if c.utb == nil {
-		return
+	if self == nil {
+		return nil
 	}
-	fetcher := c.trustBaseFetcher
-	if fetcher == nil {
-		if self == nil {
-			return
-		}
-		fetcher = &gettrustbase.Client{Peer: self}
-	}
+	return &gettrustbase.Client{Peer: self}
+}
+
+// utbPeers are the roots of the newest held committee first, then of every older one.
+func (c *BFTClientImpl) utbPeers() peer.IDSlice {
 	var peers peer.IDSlice
 	for epoch := c.utb.Tip().Epoch; ; epoch-- {
 		e, err := c.utb.Committee(epoch)
@@ -143,14 +107,72 @@ func (c *BFTClientImpl) catchUpTrustBase(ctx context.Context) {
 			break
 		}
 	}
-	from := c.utb.Tip().Epoch + 1
-	c.logger.WithContext(ctx).Info("trust-base catch-up started", "from", from, "peers", len(peers))
-	added, err := c.utb.CatchUp(ctx, &loggingFetcher{f: fetcher, c: c}, peers)
-	if err != nil {
-		c.logger.WithContext(ctx).Warn("trust-base catch-up finished", "added", added, "tip", c.utb.Tip().Epoch, "error", err.Error())
-		return
+	return peers
+}
+
+// noteAdmitted records that the history now holds the epoch: the admitted head and the admitted root peer set follow it.
+func (c *BFTClientImpl) noteAdmitted(ctx context.Context, epoch uint64) {
+	for cur := c.admittedHead.Load(); epoch > cur && !c.admittedHead.CompareAndSwap(cur, epoch); cur = c.admittedHead.Load() {
 	}
-	c.logger.WithContext(ctx).Info("trust-base catch-up finished", "added", added, "tip", c.utb.Tip().Epoch)
+	c.refreshMembership(ctx)
+}
+
+// handleCombinedResponse appends the attached signed entries and then handles the response exactly as a legacy one: the entries are an authority update
+// independent of the status, a valid entry never turns a rejection into an acceptance and an invalid one never affects the certificate. A gap only wakes
+// the catch-up worker (coalesced); the message path never fetches.
+func (c *BFTClientImpl) handleCombinedResponse(ctx context.Context, cr *certification.CertificationResponse, updates [][]byte) error {
+	c.ensureIntake()
+	if c.utb != nil && len(updates) > 0 {
+		added, gap, err := c.utb.Ingest(updates)
+		switch {
+		case err != nil:
+			c.logger.WithContext(ctx).Warn("dropping an invalid trust-base update", "error", err.Error())
+		case gap:
+			c.logger.WithContext(ctx).Info("trust-base gap in certification response", "added", added, "tip", c.utb.Tip().Epoch)
+			c.catchup.Signal()
+		case added > 0:
+			c.logger.WithContext(ctx).Info("trust-base entries appended from certification response", "added", added, "tip", c.utb.Tip().Epoch)
+		}
+		if added > 0 {
+			c.noteAdmitted(ctx, c.utb.Tip().Epoch)
+		}
+	}
+	return c.handleCertificationResponse(ctx, cr)
+}
+
+// handshakeAuthority is the committee a handshake is addressed to. With the signed history, a last certificate whose epoch is not held (a restart with a
+// fresh store) greets the newest held committee instead of failing: a handshake is only routing and grants no authority.
+func (c *BFTClientImpl) handshakeAuthority(ctx context.Context, rootEpoch uint64) (types.RootTrustBase, error) {
+	tb, err := c.authn.trustBase(ctx, rootEpoch)
+	if c.utb != nil && errors.Is(err, ErrEpochNotAdmitted) {
+		tip := c.utb.Tip().Epoch
+		c.logger.WithContext(ctx).Info("trust-base handshake to the newest held committee", "certificateEpoch", rootEpoch, "tip", tip)
+		c.catchup.Signal()
+		return c.authn.trustBase(ctx, tip)
+	}
+	return tb, err
+}
+
+// withNewestCommittee extends the selected root peers with the newest held committee's, when that epoch is newer than the certificate's: a held future
+// entry does not mean that committee is already the one certifying, so it is added, never substituted.
+func (c *BFTClientImpl) withNewestCommittee(ids peer.IDSlice, epoch uint64, pick func(types.RootTrustBase) (peer.IDSlice, error)) peer.IDSlice {
+	if c.utb == nil {
+		return ids
+	}
+	tip := c.utb.Tip().Epoch
+	if tip <= epoch {
+		return ids
+	}
+	e, err := c.utb.Committee(tip)
+	if err != nil {
+		return ids
+	}
+	more, err := pick(e)
+	if err != nil {
+		c.logger.Warn("selecting root nodes of the newest committee", "error", err.Error())
+		return ids
+	}
+	return unionPeers(ids, more)
 }
 
 // loggingFetcher records every GetTrustBase page: which root served what.

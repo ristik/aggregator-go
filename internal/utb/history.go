@@ -11,14 +11,12 @@ package utb
 
 import (
 	"context"
-	gocrypto "crypto"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/unicitynetwork/bft-go-base/types"
@@ -32,15 +30,12 @@ import (
 var (
 	// ErrUnknownEpoch: no held entry for the certificate's epoch; the caller catches up and retries, and nothing advances meanwhile.
 	ErrUnknownEpoch = errors.New("utb: no held trust-base entry for the epoch")
-	// ErrCertificate: the certificate does not verify under its own epoch's committee and activation interval.
-	ErrCertificate = errors.New("utb: certificate refused")
 )
 
 // Bundle file budget (the page limits do not apply to the complete shipped history).
 const (
 	maxBundleBytes   = 64 << 20
 	maxBundleEntries = 1 << 16
-	catchUpTimeout   = 10 * time.Second
 )
 
 // History is safe for concurrent use.
@@ -171,41 +166,12 @@ func (h *History) Ingest(updates [][]byte) (added int, gap bool, err error) {
 	return added, false, nil
 }
 
-// CatchUp fetches the missing suffix after the latest held entry from the given root peers (GetTrustBase), authenticating every entry from the one
-// before it. Authenticated prefixes are kept when a later page fails.
-func (h *History) CatchUp(ctx context.Context, f gettrustbase.Fetcher, peers []peer.ID) (int, error) {
+// CatchUpTo fetches the entries after the latest held one up to epoch "to" from the given root peers (GetTrustBase), authenticating every entry from the
+// one before it. Authenticated prefixes are kept when a later page fails.
+func (h *History) CatchUpTo(ctx context.Context, f gettrustbase.Fetcher, peers []peer.ID, to uint64) (int, error) {
 	h.syncMu.Lock()
 	defer h.syncMu.Unlock()
-	ctx, cancel := context.WithTimeout(ctx, catchUpTimeout)
-	defer cancel()
-	return gettrustbase.Sync(ctx, f, h.store, peers, gettrustbase.SyncOptions{Network: h.network})
-}
-
-// VerifyUC verifies a certificate under its own epoch: the held entry of the seal's epoch (strict weighted quorum, unknown or invalid signers fail), the
-// network, and the epoch's activation interval (the seal round is not before the epoch's start and, once the successor is held, before the successor's
-// start: a retired committee cannot certify rounds after its successor started). ErrUnknownEpoch means the authority is not known yet.
-func (h *History) VerifyUC(uc *types.UnicityCertificate, partition types.PartitionID, shard types.ShardID) error {
-	if uc == nil || uc.UnicitySeal == nil {
-		return fmt.Errorf("%w: no seal", ErrCertificate)
-	}
-	seal := uc.UnicitySeal
-	entry, err := h.Committee(seal.Epoch)
-	if err != nil {
-		return err
-	}
-	if seal.NetworkID != entry.NetworkID {
-		return fmt.Errorf("%w: network %d, epoch %d belongs to network %d", ErrCertificate, seal.NetworkID, seal.Epoch, entry.NetworkID)
-	}
-	if seal.RootChainRoundNumber < entry.EpochStart {
-		return fmt.Errorf("%w: root round %d precedes the start %d of epoch %d", ErrCertificate, seal.RootChainRoundNumber, entry.EpochStart, seal.Epoch)
-	}
-	if next, err := h.store.Entry(seal.Epoch + 1); err == nil && seal.RootChainRoundNumber >= next.EpochStart {
-		return fmt.Errorf("%w: root round %d is at or after the start %d of epoch %d", ErrCertificate, seal.RootChainRoundNumber, next.EpochStart, next.Epoch)
-	}
-	if err := uc.Verify(entry, gocrypto.SHA256, partition, shard, nil); err != nil {
-		return fmt.Errorf("%w: %w", ErrCertificate, err)
-	}
-	return nil
+	return gettrustbase.Sync(ctx, f, h.store, peers, gettrustbase.SyncOptions{Network: h.network, To: &to})
 }
 
 // errNoV1 is the answer to a version 1 trust-base request in a deployment with the signed history: a runtime projection is not a trust entry and is

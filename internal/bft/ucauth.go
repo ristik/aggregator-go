@@ -29,6 +29,9 @@ import (
 type ucAuthenticator struct {
 	network types.NetworkID
 	store   TrustBaseStore
+	// hist, when set, is the signed trust-base history (record version 2) and replaces store: authorities are its held entries and nothing is fetched
+	// on the message path (the catch-up worker extends the history)
+	hist AuthorityHistory
 
 	mu    sync.Mutex
 	known map[[sha256.Size]byte]struct{}
@@ -50,8 +53,36 @@ type ucAuthenticator struct {
 }
 
 type authorityEntry struct {
-	tb     *types.RootTrustBaseV1
+	tb     types.RootTrustBase
 	digest [sha256.Size]byte
+}
+
+// AuthorityHistory is the local view of the signed trust-base history: the held entry of an epoch, never fetched. An unknown epoch is (nil, false, nil).
+type AuthorityHistory interface {
+	GetAdmittedAuthority(ctx context.Context, epoch uint64) (types.RootTrustBase, bool, error)
+}
+
+// authorityDigest identifies the authority content of a trust base for the memo of authenticated seals: the V1 hash, or the V2 EntryID (the hash of the
+// unsigned entry, so another valid witness of the same entry is the same authority).
+func authorityDigest(tb types.RootTrustBase) ([sha256.Size]byte, error) {
+	var d [sha256.Size]byte
+	switch t := tb.(type) {
+	case *types.RootTrustBaseV1:
+		h, err := t.Hash(crypto.SHA256)
+		if err != nil {
+			return d, err
+		}
+		copy(d[:], h)
+	case *types.RootTrustBaseV2:
+		id, err := t.EntryID()
+		if err != nil {
+			return d, err
+		}
+		d = id
+	default:
+		return d, fmt.Errorf("unsupported trust base type %T", tb)
+	}
+	return d, nil
 }
 
 const (
@@ -64,6 +95,13 @@ func newUCAuthenticator(network types.NetworkID, store TrustBaseStore) *ucAuthen
 		network: network, store: store, known: map[[sha256.Size]byte]struct{}{},
 		authorities: map[uint64]*authorityEntry{}, ends: map[uint64]uint64{},
 	}
+}
+
+// newHistoryAuthenticator authenticates under the signed trust-base history.
+func newHistoryAuthenticator(network types.NetworkID, hist AuthorityHistory) *ucAuthenticator {
+	a := newUCAuthenticator(network, nil)
+	a.hist = hist
+	return a
 }
 
 // ErrEpochNotAdmitted: the epoch is not in the locally admitted trust base history (yet). It is not
@@ -81,16 +119,30 @@ func (a *ucAuthenticator) authority(ctx context.Context, epoch uint64, localOnly
 		return e, nil
 	}
 	a.authorityLoads.Add(1)
-	var tb *types.RootTrustBaseV1
+	var tb types.RootTrustBase
 	var err error
-	if h, ok := a.store.(AdmittedTrustBases); ok && localOnly {
+	if a.hist != nil {
 		var known bool
-		tb, known, err = h.GetAdmitted(ctx, epoch)
+		tb, known, err = a.hist.GetAdmittedAuthority(ctx, epoch)
 		if err == nil && !known {
 			return nil, fmt.Errorf("%w: epoch %d", ErrEpochNotAdmitted, epoch)
 		}
+	} else if h, ok := a.store.(AdmittedTrustBases); ok && localOnly {
+		var v1 *types.RootTrustBaseV1
+		var known bool
+		v1, known, err = h.GetAdmitted(ctx, epoch)
+		if err == nil && !known {
+			return nil, fmt.Errorf("%w: epoch %d", ErrEpochNotAdmitted, epoch)
+		}
+		if v1 != nil {
+			tb = v1
+		}
 	} else {
-		tb, err = a.store.GetByEpoch(ctx, epoch)
+		var v1 *types.RootTrustBaseV1
+		v1, err = a.store.GetByEpoch(ctx, epoch)
+		if v1 != nil {
+			tb = v1
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to load trust base for epoch %d: %w", epoch, err)
@@ -104,12 +156,11 @@ func (a *ucAuthenticator) authority(ctx context.Context, epoch uint64, localOnly
 	if tb.GetNetworkID() != a.network {
 		return nil, fmt.Errorf("trust base of epoch %d is of network %d, configured network is %d", epoch, tb.GetNetworkID(), a.network)
 	}
-	tbHash, err := tb.Hash(crypto.SHA256)
+	digest, err := authorityDigest(tb)
 	if err != nil {
 		return nil, fmt.Errorf("hashing trust base: %w", err)
 	}
-	e = &authorityEntry{tb: tb}
-	copy(e.digest[:], tbHash)
+	e = &authorityEntry{tb: tb, digest: digest}
 	a.mu.Lock()
 	if len(a.authorities) >= maxCachedEpochs {
 		clear(a.authorities)
@@ -120,7 +171,7 @@ func (a *ucAuthenticator) authority(ctx context.Context, epoch uint64, localOnly
 }
 
 // trustBase resolves the trust base of exactly the requested epoch of the configured network.
-func (a *ucAuthenticator) trustBase(ctx context.Context, epoch uint64) (*types.RootTrustBaseV1, error) {
+func (a *ucAuthenticator) trustBase(ctx context.Context, epoch uint64) (types.RootTrustBase, error) {
 	e, err := a.authority(ctx, epoch, false)
 	if err != nil {
 		return nil, err
@@ -261,9 +312,9 @@ func (a *ucAuthenticator) epochEnd(ctx context.Context, epoch uint64) (uint64, b
 
 func (a *ucAuthenticator) nextEpochStart(ctx context.Context, epoch uint64) (uint64, bool, error) {
 	a.historyLookups.Add(1)
-	var next *types.RootTrustBaseV1
-	if h, ok := a.store.(AdmittedTrustBases); ok {
-		tb, known, err := h.GetAdmitted(ctx, epoch+1)
+	var next types.RootTrustBase
+	if a.hist != nil {
+		tb, known, err := a.hist.GetAdmittedAuthority(ctx, epoch+1)
 		if err != nil {
 			return 0, false, err
 		}
@@ -271,6 +322,17 @@ func (a *ucAuthenticator) nextEpochStart(ctx context.Context, epoch uint64) (uin
 			return 0, false, nil
 		}
 		next = tb
+	} else if h, ok := a.store.(AdmittedTrustBases); ok {
+		tb, known, err := h.GetAdmitted(ctx, epoch+1)
+		if err != nil {
+			return 0, false, err
+		}
+		if !known {
+			return 0, false, nil
+		}
+		if tb != nil {
+			next = tb
+		}
 	} else {
 		tb, err := a.store.GetByEpoch(ctx, epoch+1)
 		if err != nil {
@@ -279,7 +341,9 @@ func (a *ucAuthenticator) nextEpochStart(ctx context.Context, epoch uint64) (uin
 			}
 			return 0, false, fmt.Errorf("failed to load trust base for epoch %d: %w", epoch+1, err)
 		}
-		next = tb
+		if tb != nil {
+			next = tb
+		}
 	}
 	if next == nil {
 		return 0, false, nil
