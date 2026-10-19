@@ -274,6 +274,6 @@ require (
 
 // Provisional pins (bft-core sync draft PR #650, commit bbf89daad; re-pin when it merges): the bft-core with the signed trust-base history and the
 // combined 0.0.3 response, and the bft-go-base it pins.
-replace github.com/unicitynetwork/bft-core => github.com/ristik/bft-core v1.1.1-0.20261019191546-bbf89daad125
+replace github.com/unicitynetwork/bft-core => github.com/ristik/bft-core v1.1.1-0.20261019192856-f4f324197c63
 
 replace github.com/unicitynetwork/bft-go-base => github.com/ristik/bft-go-base v1.1.1-0.20261019185200-6174434eeb99
