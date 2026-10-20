@@ -132,6 +132,9 @@ func (c *BFTClientImpl) handleCombinedResponse(ctx context.Context, cr *certific
 			c.catchup.Signal()
 		case added > 0:
 			c.logger.WithContext(ctx).Info("trust-base entries appended from certification response", "added", added, "tip", c.utb.Tip().Epoch)
+		default:
+			// every attached entry was already held (the catch-up worker, or an earlier response, got there first): the attachment was read and checked, and added nothing
+			c.logger.WithContext(ctx).Debug("trust-base update already held", "attached", len(updates), "tip", c.utb.Tip().Epoch)
 		}
 		if added > 0 {
 			c.noteAdmitted(ctx, c.utb.Tip().Epoch)

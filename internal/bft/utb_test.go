@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -302,4 +303,23 @@ func TestAuthorityDigestIdentifiesTheEntryNotItsWitness(t *testing.T) {
 	require.NotEqual(t, d2, dg)
 	_, err = authorityDigest(nil)
 	require.Error(t, err)
+}
+
+// An attachment which adds nothing (every entry already held) is not silent: it is logged at DEBUG, so the evidence can show it was consumed. A new entry is
+// logged at INFO as before and does not produce the DEBUG line.
+func TestAnAttachmentWhichAddsNothingIsLoggedAtDebug(t *testing.T) {
+	logFile := filepath.Join(t.TempDir(), "agg.log")
+	lg, err := logger.NewWithConfig(logger.LogConfig{Level: "debug", Format: "json", Output: "stdout", EnableJSON: true, FilePath: logFile})
+	require.NoError(t, err)
+	c, h, _, _, e2raw, _ := threeEpochs(t, utbtest.Partition)
+	c.logger = lg
+	cr := signedResponse(t, 1, utbtest.NewMembers(t, 4)[:3])
+	_ = c.handleCombinedResponse(context.Background(), cr, [][]byte{e2raw}) // new: appended
+	require.Equal(t, uint64(2), h.Tip().Epoch)
+	_ = c.handleCombinedResponse(context.Background(), cr, [][]byte{e2raw}) // the same entry again: nothing added
+	raw, err := os.ReadFile(logFile)
+	require.NoError(t, err)
+	require.Equal(t, 1, strings.Count(string(raw), "trust-base entries appended from certification response"), string(raw))
+	require.Equal(t, 1, strings.Count(string(raw), "trust-base update already held"), string(raw))
+	require.NotContains(t, string(raw), "trust-base gap in certification response")
 }
