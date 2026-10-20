@@ -338,6 +338,9 @@ type BFTConfig struct {
 
 	// BFT node REST api address
 	RPCAddress string `mapstructure:"rpc_address"`
+
+	// UTB enables the signed trust-base history (record version 2) instead of the version 1 trust bases.
+	UTB UTBConfig `mapstructure:"utb"`
 }
 
 // ConsolidationShard is one shard of the trusted consolidation topology.
@@ -346,7 +349,22 @@ type ConsolidationShard struct {
 	ConfigHash string        `json:"configHash"` // hex SHA-256 of the shard's PartitionDescriptionRecord
 }
 
+// UTBConfig is the signed trust-base history of a deployment whose roots publish signed entries. It is enabled by the pinned genesis EntryID; the shipped
+// history is either the complete tagged bundle or, for a fresh chain, the canonical genesis entry alone.
+type UTBConfig struct {
+	GenesisID   string `mapstructure:"genesis_id"`   // UTB_GENESIS_ID, 0x-prefixed SHA-256: the pin
+	GenesisFile string `mapstructure:"genesis_file"` // UTB_GENESIS_FILE
+	BundleFile  string `mapstructure:"bundle_file"`  // UTB_BUNDLE_FILE
+	EntriesDB   string `mapstructure:"entries_db"`   // UTB_ENTRIES_DB, the local store
+}
+
+// Enabled reports whether the signed trust-base history is configured.
+func (c UTBConfig) Enabled() bool { return c.GenesisID != "" }
+
 func (c *BFTConfig) Validate() error {
+	if c.UTB.Enabled() && (!c.Enabled || (c.UTB.GenesisFile == "") == (c.UTB.BundleFile == "")) {
+		return errors.New("UTB_GENESIS_ID needs BFT_ENABLED and exactly one of UTB_GENESIS_FILE, UTB_BUNDLE_FILE")
+	}
 	if c.Enabled {
 		if len(c.BootstrapAddresses) == 0 {
 			return errors.New("BFT_BOOTSTRAP_ADDRESSES must be specified when BFT is enabled")
@@ -512,6 +530,12 @@ func Load() (*Config, error) {
 		BootstrapConnectRetryDelay: getEnvIntOrDefault("BFT_BOOTSTRAP_CONNECT_RETRY_DELAY", 5),
 		HeartbeatInterval:          getEnvDurationOrDefault("BFT_HEARTBEAT_INTERVAL", "1s"),
 		InactivityTimeout:          getEnvDurationOrDefault("BFT_INACTIVITY_TIMEOUT", "5s"),
+		UTB: UTBConfig{
+			GenesisID:   getEnvOrDefault("UTB_GENESIS_ID", ""),
+			GenesisFile: getEnvOrDefault("UTB_GENESIS_FILE", ""),
+			BundleFile:  getEnvOrDefault("UTB_BUNDLE_FILE", ""),
+			EntriesDB:   getEnvOrDefault("UTB_ENTRIES_DB", "utb-entries.db"),
+		},
 	}
 	if config.BFT.Enabled {
 		config.BFT.KeyConf = config.Signing.KeyConf
@@ -524,6 +548,9 @@ func Load() (*Config, error) {
 			}
 		}
 		trustBaseFiles := strings.Split(getEnvOrDefault("BFT_TRUST_BASE_FILES", "bft-config/trust-base.json"), ",")
+		if config.BFT.UTB.Enabled() {
+			trustBaseFiles = nil // version 1 trust bases are not used with the signed history
+		}
 		config.BFT.TrustBases = make([]types.RootTrustBaseV1, 0, len(trustBaseFiles))
 		for _, file := range trustBaseFiles {
 			trustBaseV1 := types.RootTrustBaseV1{}

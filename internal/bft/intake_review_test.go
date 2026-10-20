@@ -43,7 +43,7 @@ func (f *flakyHistory) Head(ctx context.Context) (uint64, error) {
 	return f.IntakeTrustBases.Head(ctx)
 }
 
-func (f *flakyHistory) GetByEpochLocal(ctx context.Context, epoch uint64) (*types.RootTrustBaseV1, error) {
+func (f *flakyHistory) GetByEpochLocal(ctx context.Context, epoch uint64) (types.RootTrustBase, error) {
 	if f.failGets.Load() > 0 && f.failGets.Add(-1) >= 0 {
 		return nil, context.DeadlineExceeded
 	}

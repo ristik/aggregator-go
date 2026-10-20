@@ -639,7 +639,7 @@
   "corpus": "non-inclusion",
   "generator": {
     "command": "UC_FIXTURE_AGGREGATOR_COMMIT=\u003ccommit\u003e go run ./cmd/gen-ni-fixtures -out testdata/non-inclusion/v2",
-    "commit": "b25dd916fba88b18066bf239b6130b386d3347dd",
+    "commit": "20f83d06004516a25f46c871d71c6ea2a812f4f3",
     "modules": {
       "github.com/unicitynetwork/bft-core": "v1.1.1-0.20261019010732-0800b70ef621",
       "github.com/unicitynetwork/bft-go-base": "v1.1.1-0.20261018233336-465dccf17fba"

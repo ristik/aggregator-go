@@ -181,8 +181,9 @@ func TestCorpusPositiveCases(t *testing.T) {
 				}
 			}
 
-			// the producer's legacy response is the four element array; v2 wraps the same one
-			require.EqualValues(t, 0x84, files[consolidationcorpus.FileResponseV1][0])
+			// the producer's legacy response is the six element array of bft-core's CertificationResponse (partition, shard, technical record, UC, status,
+			// message); v2 wraps the same one
+			require.EqualValues(t, 0x86, files[consolidationcorpus.FileResponseV1][0])
 			require.EqualValues(t, 0x83, files[consolidationcorpus.FileResponseV2][0])
 			require.Equal(t, uint8(2), files[consolidationcorpus.FileResponseV2][1])
 			require.True(t, bytes.Contains(files[consolidationcorpus.FileResponseV2], files[consolidationcorpus.FilePartitionView]))
