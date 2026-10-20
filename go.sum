@@ -584,10 +584,10 @@ github.com/raulk/go-watchdog v1.3.0 h1:oUmdlHxdkXRJlwfG0O9omj8ukerm8MEQavSiDTEtB
 github.com/raulk/go-watchdog v1.3.0/go.mod h1:fIvOnLbF0b0ZwkB9YU4mOW9Did//4vPZtDqv66NfsMU=
 github.com/redis/go-redis/v9 v9.14.0 h1:u4tNCjXOyzfgeLN+vAZaW1xUooqWDqVEsZN0U01jfAE=
 github.com/redis/go-redis/v9 v9.14.0/go.mod h1:huWgSWd8mW6+m0VPhJjSSQ+d6Nh1VICQ6Q5lHuCH/Iw=
-github.com/ristik/bft-core v1.1.1-0.20261019192856-f4f324197c63 h1:gZF4KseT0P3cOHDTDbYXxva3IckZKNXnRbcLN25UMtk=
-github.com/ristik/bft-core v1.1.1-0.20261019192856-f4f324197c63/go.mod h1:H/aXs7wGGkcFlW5fub5M6lgzsJMcFoHOhsxO3UIM5dg=
-github.com/ristik/bft-go-base v1.1.1-0.20261019185200-6174434eeb99 h1:R3DO7ZNRQbByK2eGkhb2rheTqf/x7lfXzSu+Ve1uCQs=
-github.com/ristik/bft-go-base v1.1.1-0.20261019185200-6174434eeb99/go.mod h1:hBnOG52VRy/vpgIBUulTgk7PBTwODZ2xkVjCEu5yRcQ=
+github.com/ristik/bft-core v1.1.1-0.20261020004441-12f16641d74f h1:Q2w97UiOeh9N4BiYqbK05T1tiV2HWZM6VxKHKusNwSE=
+github.com/ristik/bft-core v1.1.1-0.20261020004441-12f16641d74f/go.mod h1:f1UC+UMtjtkyoaxNAih1SkWw8r5ZWq5jswSult8j1Xg=
+github.com/ristik/bft-go-base v1.1.1-0.20261019192807-8890ddce75de h1:1w6G26S/pGmm/K36WWbm936GocDG4KCRM0y1lgPdqeE=
+github.com/ristik/bft-go-base v1.1.1-0.20261019192807-8890ddce75de/go.mod h1:hBnOG52VRy/vpgIBUulTgk7PBTwODZ2xkVjCEu5yRcQ=
 github.com/rivo/uniseg v0.2.0 h1:S1pD9weZBuJdFmowNwbpi7BJ8TNftyUImj/0WQi72jY=
 github.com/rivo/uniseg v0.2.0/go.mod h1:J6wj4VEh+S6ZtnVlnTBMWIodfgj8LQOQFoIToxlJtxc=
 github.com/rogpeppe/go-internal v1.9.0/go.mod h1:WtVeX8xhTBvf0smdhujwtBcq4Qrzq/fJaraNFVN+nFs=
