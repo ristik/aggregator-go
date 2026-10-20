@@ -22,6 +22,7 @@ import (
 	"github.com/unicitynetwork/bft-core/network"
 	"github.com/unicitynetwork/bft-core/network/protocol/certification"
 	"github.com/unicitynetwork/bft-core/network/protocol/handshake"
+	"github.com/unicitynetwork/bft-core/shardnode"
 	cryptobft "github.com/unicitynetwork/bft-go-base/crypto"
 	"github.com/unicitynetwork/bft-go-base/types"
 
@@ -44,8 +45,11 @@ var (
 	ErrStaleCertificationRound = errors.New("stale certification round")
 	ErrCertifiedRootMismatch   = errors.New("certified root does not match proposed block root")
 	ErrInvalidUCSequence       = errors.New("invalid unicity certificate sequence")
-	ErrCertifiedStateMismatch  = errors.New("local committed state does not match latest certified root")
-	ErrBFTClientStopping       = errors.New("BFT client is stopping")
+	// ErrStaleUC marks an authentic certificate this client has already moved past (an older partition round, or the held one re-issued at an earlier root round): a
+	// lagging root answers with it. The refusal is unchanged (it also satisfies ErrInvalidUCSequence), it is routine and not logged as a fault.
+	ErrStaleUC                = errors.New("stale unicity certificate")
+	ErrCertifiedStateMismatch = errors.New("local committed state does not match latest certified root")
+	ErrBFTClientStopping      = errors.New("BFT client is stopping")
 )
 
 // BFTClientImpl handles communication with the BFT root chain via P2P network
@@ -555,25 +559,35 @@ func (c *BFTClientImpl) handleMessage(ctx context.Context, msg any) {
 	case *certification.CertificationResponse:
 		c.logger.WithContext(ctx).Info("received CertificationResponse")
 		if err := c.handleCertificationResponse(ctx, mt); err != nil {
-			c.logger.WithContext(ctx).Error("error processing CertificationResponse message", "error", err.Error())
+			c.logResponseError(ctx, "CertificationResponse", err)
 		}
 	case *certification.CertificationResponseV2:
 		c.logger.WithContext(ctx).Info("received CertificationResponseV2")
 		// The envelope is already structurally valid (version, framing). The ordinary
 		// response goes through the unchanged handler; the opaque view is optional.
 		if err := c.handleCertificationResponse(ctx, mt.Legacy()); err != nil {
-			c.logger.WithContext(ctx).Error("error processing CertificationResponseV2 message", "error", err.Error())
+			c.logResponseError(ctx, "CertificationResponseV2", err)
 		}
 	default:
 		if cr, updates, ok := combinedFrom(msg); ok {
 			c.logger.WithContext(ctx).Info("received CertificationResponseV3", "trustBaseUpdates", len(updates))
 			if err := c.handleCombinedResponse(ctx, cr, updates); err != nil {
-				c.logger.WithContext(ctx).Error("error processing CertificationResponseV3 message", "error", err.Error())
+				c.logResponseError(ctx, "CertificationResponseV3", err)
 			}
 			return
 		}
 		c.logger.WithContext(ctx).Info("received unknown message")
 	}
+}
+
+// logResponseError reports a response that could not be processed: a stale certificate (a lagging root's answer) is routine and only counted, anything else is a fault.
+func (c *BFTClientImpl) logResponseError(ctx context.Context, kind string, err error) {
+	if errors.Is(err, ErrStaleUC) {
+		metrics.BFTStaleUCTotal.WithLabelValues(c.shardID.String()).Inc()
+		c.logger.WithContext(ctx).Debug("ignoring a stale unicity certificate (a root that lags)", "message", kind, "reason", err.Error())
+		return
+	}
+	c.logger.WithContext(ctx).Error("error processing "+kind+" message", "error", err.Error())
 }
 
 func (c *BFTClientImpl) handleCertificationResponse(ctx context.Context, cr *certification.CertificationResponse) error {
@@ -660,6 +674,11 @@ func (c *BFTClientImpl) handleUnicityCertificate(ctx context.Context, uc *types.
 	}
 
 	if prevLUC != nil {
+		// as bft-core classifies it: an authentic certificate already moved past is ignored (nothing below runs, no state or liveness changes); faults stay faults
+		if class, cerr := shardnode.ClassifyUC(prevLUC, uc); cerr == nil && class == shardnode.UCStale {
+			return fmt.Errorf("%w: %w: partition round %d at root round %d, held partition round %d at root round %d", ErrStaleUC, ErrInvalidUCSequence,
+				uc.GetRoundNumber(), uc.GetRootRoundNumber(), prevLUC.GetRoundNumber(), prevLUC.GetRootRoundNumber())
+		}
 		if err := types.CheckNonEquivocatingCertificates(prevLUC, uc); err != nil {
 			return fmt.Errorf("%w: %w", ErrInvalidUCSequence, err)
 		}
