@@ -1104,3 +1104,70 @@ func testUnicityCertificate(round, rootRound uint64, root []byte, previous []byt
 		UnicitySeal: &types.UnicitySeal{RootChainRoundNumber: rootRound, Timestamp: testSealTimestamp},
 	}
 }
+
+// The root repeats the UC it already sent (the inactivity handshake's reply) and still waits for the round this node has requested: the request is re-sent, bounded
+// and only when it is old enough to be lost. Every other case leaves the request alone.
+func TestBFTClientResendsTheOutstandingRequestOnARepeatedUC(t *testing.T) {
+	log, err := logger.New("warn", "json", "", false)
+	require.NoError(t, err)
+	root := bytes.Repeat([]byte{0x10}, api.SiblingSize)
+	type call struct {
+		hash  string
+		round uint64
+	}
+	setup := func(proposed uint64, age time.Duration) (*BFTClientImpl, *[]call) {
+		var calls []call
+		c := &BFTClientImpl{logger: log, roundManager: &stubRoundManager{committedRoot: root}}
+		c.status.Store(normal)
+		c.sendRequest = func(_ context.Context, rootHash string, round uint64, _ uint64) error {
+			calls = append(calls, call{rootHash, round})
+			return nil
+		}
+		uc := testUnicityCertificate(11, 21, root, nil)
+		c.luc.Store(uc)
+		c.lastRootRound.Store(21)
+		c.nextExpectedRound.Store(12)
+		if proposed > 0 {
+			c.proposedBlock = models.NewBlock(api.NewBigIntFromUint64(proposed), "unicity", 0, "1.0", "mainnet", api.NewHexBytes(bytes.Repeat([]byte{0x20}, api.SiblingSize)), api.NewHexBytes(root), nil, testSealTimestamp)
+			c.certRequestTime.Store(time.Now().Add(-age).UnixNano())
+		}
+		return c, &calls
+	}
+	dup := func(c *BFTClientImpl, round uint64) {
+		require.NoError(t, c.handleUnicityCertificate(t.Context(), testUnicityCertificate(11, 21, root, nil), &certification.TechnicalRecord{Round: round, Epoch: 1}))
+	}
+
+	t.Run("an old outstanding request is re-sent, bounded per round", func(t *testing.T) {
+		c, calls := setup(12, 5*time.Second)
+		dup(c, 12)
+		require.Len(t, *calls, 1)
+		require.EqualValues(t, 12, (*calls)[0].round)
+		dup(c, 12) // the re-send just refreshed the request time: too young again
+		require.Len(t, *calls, 1)
+		for i := 0; i < 5; i++ {
+			c.certRequestTime.Store(time.Now().Add(-5 * time.Second).UnixNano())
+			dup(c, 12)
+		}
+		require.Len(t, *calls, resendMaxPerRnd, "at most resendMaxPerRnd re-sends for one round")
+	})
+	t.Run("a young request is left alone (the duplicate of a UC from another root)", func(t *testing.T) {
+		c, calls := setup(12, 100*time.Millisecond)
+		dup(c, 12)
+		require.Empty(t, *calls)
+	})
+	t.Run("the root waits for another round than the requested one", func(t *testing.T) {
+		c, calls := setup(12, 5*time.Second)
+		dup(c, 13)
+		require.Empty(t, *calls)
+	})
+	t.Run("nothing is outstanding", func(t *testing.T) {
+		c, calls := setup(0, 0)
+		dup(c, 12)
+		require.Empty(t, *calls)
+	})
+	t.Run("a failed re-send does not break the UC handling", func(t *testing.T) {
+		c, _ := setup(12, 5*time.Second)
+		c.sendRequest = func(context.Context, string, uint64, uint64) error { return errors.New("no route") }
+		dup(c, 12)
+	})
+}

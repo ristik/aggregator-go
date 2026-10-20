@@ -86,6 +86,11 @@ type (
 		lastCertResponseTime atomic.Int64
 		// timestamp when last certification request was sent (unix nano)
 		certRequestTime atomic.Int64
+		// the bounded re-send of an outstanding request (see resendOutstandingLocked); guarded by ucProcessingMutex
+		resendRound uint64
+		resendCount int
+		// sendRequest sends a certification request; nil means sendCertificationRequest (a seam for tests)
+		sendRequest func(ctx context.Context, rootHash string, roundNumber uint64, referenceTime uint64) error
 
 		trustBaseStore TrustBaseStore
 		// utb is the signed trust-base history (record version 2); when set, certificates are authenticated from it and trustBaseStore is not used
@@ -662,6 +667,7 @@ func (c *BFTClientImpl) handleUnicityCertificate(ctx context.Context, uc *types.
 	if uc.IsDuplicate(prevLUC) {
 		if !wasInitializing {
 			c.logger.WithContext(ctx).Debug(fmt.Sprintf("duplicate UC (same root round %d)", uc.GetRootRoundNumber()))
+			c.resendOutstandingLocked(ctx, tr)
 			return nil
 		}
 		c.logger.WithContext(ctx).Info("Using retained UC to complete BFT client initialization",
@@ -1287,6 +1293,47 @@ func (c *BFTClientImpl) abandonProposedBlockLocked(ctx context.Context, reason s
 	c.proposedBlock = nil
 	c.resumedDurableProposal = false
 	return nil
+}
+
+// A request which is still outstanding when the root repeats the UC it already sent is re-sent, bounded: the root names the round it waits for (the technical
+// record) and it is the round this node has already requested, so either the request was lost (a handoff blackout, a restart of a root) or the root has
+// not yet taken it. The inactivity handshake's reply is such a duplicate. Without this the node waits for the root's T2 timeout. The request is the same
+// block, the same input record and the same signature; the root accepts a repeat of a request it has, so the re-send is idempotent.
+const (
+	resendMinAge    = 2 * time.Second // a request younger than this is still on its way: the usual duplicate of a UC from another root arrives within ms of the first
+	resendMaxPerRnd = 3               // re-sends per round; after that the root's T2 timeout does what it did before
+)
+
+// resendOutstandingLocked is called with ucProcessingMutex held, for a duplicate UC with the technical record tr. It reports whether it re-sent.
+func (c *BFTClientImpl) resendOutstandingLocked(ctx context.Context, tr *certification.TechnicalRecord) bool {
+	block := c.proposedBlock
+	if block == nil || tr == nil || block.Index == nil || block.Index.Uint64() != tr.Round {
+		return false
+	}
+	sent := c.certRequestTime.Load()
+	if sent == 0 || time.Since(time.Unix(0, sent)) < resendMinAge {
+		return false
+	}
+	if c.resendRound != tr.Round {
+		c.resendRound, c.resendCount = tr.Round, 0
+	}
+	if c.resendCount >= resendMaxPerRnd {
+		return false
+	}
+	c.resendCount++
+	send := c.sendRequest
+	if send == nil {
+		send = c.sendCertificationRequest
+	}
+	c.logger.WithContext(ctx).Info("Re-sending the outstanding certification request: the root repeats the UC and still waits for this round",
+		"round", tr.Round, "attempt", c.resendCount, "age", time.Since(time.Unix(0, sent)).String())
+	c.certRequestTime.Store(time.Now().UnixNano())
+	if err := send(ctx, block.RootHash.String(), block.Index.Uint64(), block.ReferenceTime); err != nil {
+		metrics.BFTErrorsTotal.Inc()
+		c.logger.WithContext(ctx).Warn("Re-sending the outstanding certification request failed", "round", tr.Round, "error", err.Error())
+		return false
+	}
+	return true
 }
 
 func (c *BFTClientImpl) resumeDurableProposalLocked(ctx context.Context, roundNumber *api.BigInt) (bool, error) {
