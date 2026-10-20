@@ -1,6 +1,7 @@
 package bft
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/sha256"
@@ -32,6 +33,10 @@ type ucAuthenticator struct {
 	// hist, when set, is the signed trust-base history (record version 2) and replaces store: authorities are its held entries and nothing is fetched
 	// on the message path (the catch-up worker extends the history)
 	hist AuthorityHistory
+	// shardConfHash is the configuration hash this shard's certificates must commit to (nil:
+	// unchecked, tests only): a certificate that commits to another configuration is not this
+	// shard's.
+	shardConfHash []byte
 
 	mu    sync.Mutex
 	known map[[sha256.Size]byte]struct{}
@@ -95,6 +100,12 @@ func newUCAuthenticator(network types.NetworkID, store TrustBaseStore) *ucAuthen
 		network: network, store: store, known: map[[sha256.Size]byte]struct{}{},
 		authorities: map[uint64]*authorityEntry{}, ends: map[uint64]uint64{},
 	}
+}
+
+// withShardConfHash pins the configuration hash the certificates of this shard must commit to.
+func (a *ucAuthenticator) withShardConfHash(h []byte) *ucAuthenticator {
+	a.shardConfHash = bytes.Clone(h)
+	return a
 }
 
 // newHistoryAuthenticator authenticates under the signed trust-base history.
@@ -263,7 +274,7 @@ func (o *authOp) verifyUC(uc *types.UnicityCertificate, partition types.Partitio
 	if uc.UnicitySeal.NetworkID != a.network {
 		return fmt.Errorf("unicity seal is of network %d, configured network is %d", uc.UnicitySeal.NetworkID, a.network)
 	}
-	if err := uc.IsValid(partition, shard, nil); err != nil {
+	if err := uc.IsValid(partition, shard, a.shardConfHash); err != nil {
 		return fmt.Errorf("invalid unicity certificate: %w", err)
 	}
 	shardRoot, err := uc.ShardTreeCertificate.ComputeCertificateHash(uc.InputRecord, uc.TRHash, uc.ShardConfHash, crypto.SHA256)

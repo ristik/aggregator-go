@@ -132,6 +132,7 @@ func TestUnknownEpochIsDroppedThenCaughtUpByTheWorker(t *testing.T) {
 	c.trustBaseFetcher = f
 	uc := utbtest.Certificate(t, 5, 2, 150, j[:3])
 	partition := utbtest.Partition
+	c.authn.withShardConfHash(uc.ShardConfHash) // the fixture certificate's own configuration
 
 	err := c.authn.beginIntake(context.Background()).verifyUC(uc, partition, types.ShardID{})
 	require.ErrorIs(t, err, ErrEpochNotAdmitted)

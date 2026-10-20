@@ -301,7 +301,7 @@ func GenerateDocsHTML() string {
         <div class="method-section">
             <div class="method-header">get_no_deletion_proof</div>
             <div class="method-content">
-                <div class="description">Retrieve the global no-deletion proof for the aggregator data structure.</div>
+                <div class="description">Not supported: always answers the JSON-RPC error -32601 (no placeholder result).</div>
                 
                 <div class="params-container">
                     <div class="params-section">

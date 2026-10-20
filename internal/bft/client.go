@@ -3,6 +3,7 @@ package bft
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -187,6 +188,11 @@ func NewBFTClient(
 		bftClient.authn = newHistoryAuthenticator(conf.ShardConf.NetworkID, utbAuthority{bftClient.utb})
 		bftClient.admittedHead.Store(bftClient.utb.Tip().Epoch)
 	}
+	confHash, err := conf.ShardConf.Hash(crypto.SHA256)
+	if err != nil {
+		return nil, fmt.Errorf("hashing the shard configuration: %w", err)
+	}
+	bftClient.authn.withShardConfHash(confHash)
 	topo, err := proofTopologyFromConfig(conf)
 	if err != nil {
 		return nil, fmt.Errorf("invalid consolidation topology: %w", err)
