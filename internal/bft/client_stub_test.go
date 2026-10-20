@@ -1104,3 +1104,108 @@ func testUnicityCertificate(round, rootRound uint64, root []byte, previous []byt
 		UnicitySeal: &types.UnicitySeal{RootChainRoundNumber: rootRound, Timestamp: testSealTimestamp},
 	}
 }
+
+// The pending request is re-submitted, as the same signed bytes, only when the root answers with a duplicate of the UC this node holds (same partition round and same
+// root round) while the request is pending; at most once per such answer, not more often than ResubmitMinInterval and at most MaxResubmits times.
+func TestBFTClientResubmitsThePendingRequestOnADuplicateAnswer(t *testing.T) {
+	log, err := logger.New("warn", "json", "", false)
+	require.NoError(t, err)
+	root := bytes.Repeat([]byte{0x10}, api.SiblingSize)
+	t0 := time.Unix(1_700_000_000, 0)
+
+	type fixture struct {
+		c         *BFTClientImpl
+		delivered []*certification.BlockCertificationRequest
+		clock     time.Time
+	}
+	setup := func(proposed uint64) *fixture {
+		f := &fixture{clock: t0}
+		c := &BFTClientImpl{logger: log, roundManager: &stubRoundManager{committedRoot: root}}
+		c.status.Store(normal)
+		c.now = func() time.Time { return f.clock }
+		c.deliver = func(_ context.Context, req *certification.BlockCertificationRequest, _ *types.UnicityCertificate) error {
+			f.delivered = append(f.delivered, req)
+			return nil
+		}
+		c.luc.Store(testUnicityCertificate(11, 21, root, nil))
+		c.lastRootRound.Store(21)
+		c.nextExpectedRound.Store(12)
+		if proposed > 0 {
+			c.proposedBlock = models.NewBlock(api.NewBigIntFromUint64(proposed), "unicity", 0, "1.0", "mainnet", api.NewHexBytes(bytes.Repeat([]byte{0x20}, api.SiblingSize)), api.NewHexBytes(root), nil, testSealTimestamp)
+			// the request as the first submission left it: signed once. This client has no signer: a re-submission which signed again would fail
+			c.pending = &pendingRequest{round: proposed, req: &certification.BlockCertificationRequest{PartitionID: c.PartitionID(), InputRecord: &types.InputRecord{Version: 1, RoundNumber: proposed}, Signature: []byte("signed-once")}, sentAt: t0}
+			f.clock = t0
+		}
+		c.conf = &config.BFTConfig{}
+		f.c = c
+		return f
+	}
+	answer := func(f *fixture, uc *types.UnicityCertificate, round uint64) {
+		require.NoError(t, f.c.handleUnicityCertificate(t.Context(), uc, &certification.TechnicalRecord{Round: round, Epoch: 1}))
+	}
+	held := func() *types.UnicityCertificate { return testUnicityCertificate(11, 21, root, nil) }
+
+	t.Run("the blackout: handshake answers with the held UC re-deliver the same signed request, bounded", func(t *testing.T) {
+		f := setup(12)
+		original := f.c.pending.req
+		for i := 0; i < 15; i++ {
+			f.clock = f.clock.Add(ResubmitMinInterval) // the inactivity handshake of every period
+			answer(f, held(), 12)
+		}
+		require.Len(t, f.delivered, MaxResubmits, "at most MaxResubmits re-sends of one request")
+		for _, d := range f.delivered {
+			require.Same(t, original, d, "the same signed request, never rebuilt")
+			require.EqualValues(t, []byte("signed-once"), d.Signature, "and never re-signed")
+		}
+	})
+	t.Run("not more often than ResubmitMinInterval, and once per answer", func(t *testing.T) {
+		f := setup(12)
+		f.clock = f.clock.Add(ResubmitMinInterval - time.Millisecond)
+		answer(f, held(), 12)
+		require.Empty(t, f.delivered, "the request is still young: the duplicate of a UC from another root")
+		f.clock = f.clock.Add(time.Millisecond)
+		answer(f, held(), 12)
+		require.Len(t, f.delivered, 1)
+		answer(f, held(), 12) // a second answer in the same instant
+		require.Len(t, f.delivered, 1)
+	})
+	t.Run("a root answer which is not a duplicate of the held UC never triggers", func(t *testing.T) {
+		f := setup(12)
+		f.clock = f.clock.Add(time.Minute)
+		// the same root round, another (older) partition round: refused by the sequence check, and it never reaches the re-submission
+		require.Error(t, f.c.handleUnicityCertificate(t.Context(), testUnicityCertificate(10, 21, root, nil), &certification.TechnicalRecord{Round: 12, Epoch: 1}))
+		require.Empty(t, f.delivered)
+	})
+	t.Run("the root waits for another round than the pending one", func(t *testing.T) {
+		f := setup(12)
+		f.clock = f.clock.Add(time.Minute)
+		answer(f, held(), 13)
+		require.Empty(t, f.delivered)
+	})
+	t.Run("nothing is pending", func(t *testing.T) {
+		f := setup(0)
+		f.clock = f.clock.Add(time.Minute)
+		answer(f, held(), 12)
+		require.Empty(t, f.delivered)
+	})
+	t.Run("a new request starts its counters anew", func(t *testing.T) {
+		f := setup(12)
+		for i := 0; i < MaxResubmits+2; i++ {
+			f.clock = f.clock.Add(ResubmitMinInterval)
+			answer(f, held(), 12)
+		}
+		require.Len(t, f.delivered, MaxResubmits)
+		f.c.pending = &pendingRequest{round: 12, req: f.c.pending.req, sentAt: f.clock}
+		f.clock = f.clock.Add(ResubmitMinInterval)
+		answer(f, held(), 12)
+		require.Len(t, f.delivered, MaxResubmits+1)
+	})
+	t.Run("a failed delivery does not break the UC handling", func(t *testing.T) {
+		f := setup(12)
+		f.c.deliver = func(context.Context, *certification.BlockCertificationRequest, *types.UnicityCertificate) error {
+			return errors.New("no route")
+		}
+		f.clock = f.clock.Add(ResubmitMinInterval)
+		answer(f, held(), 12)
+	})
+}

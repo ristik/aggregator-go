@@ -86,6 +86,12 @@ type (
 		lastCertResponseTime atomic.Int64
 		// timestamp when last certification request was sent (unix nano)
 		certRequestTime atomic.Int64
+		// the signed request of the round in flight, kept to be re-submitted as it is (never re-signed or rebuilt); guarded by ucProcessingMutex
+		pending *pendingRequest
+		// deliver submits a signed request to the root nodes; nil means submitSigned (a seam for tests)
+		deliver func(ctx context.Context, req *certification.BlockCertificationRequest, luc *types.UnicityCertificate) error
+		// now is the clock of the re-submit pacing; nil means time.Now
+		now func() time.Time
 
 		trustBaseStore TrustBaseStore
 		// utb is the signed trust-base history (record version 2); when set, certificates are authenticated from it and trustBaseStore is not used
@@ -662,6 +668,7 @@ func (c *BFTClientImpl) handleUnicityCertificate(ctx context.Context, uc *types.
 	if uc.IsDuplicate(prevLUC) {
 		if !wasInitializing {
 			c.logger.WithContext(ctx).Debug(fmt.Sprintf("duplicate UC (same root round %d)", uc.GetRootRoundNumber()))
+			c.resubmitPendingLocked(ctx, uc, prevLUC, tr)
 			return nil
 		}
 		c.logger.WithContext(ctx).Info("Using retained UC to complete BFT client initialization",
@@ -1289,6 +1296,53 @@ func (c *BFTClientImpl) abandonProposedBlockLocked(ctx context.Context, reason s
 	return nil
 }
 
+// pendingRequest is the signed request of the round in flight and the state of its re-submission.
+type pendingRequest struct {
+	round   uint64
+	req     *certification.BlockCertificationRequest
+	sentAt  time.Time // the last submission
+	resends int
+}
+
+// The request of a round is pending from its submission until a UC of that round or later arrives. The root answers a handshake (and any delivery) with the UC it
+// holds for this shard; when that is the very UC this node holds (the same partition round and the same root round) while a request is pending, the root has not
+// taken the request (a handoff blackout, a restart of a root, a lost message) and nothing else will make it: the node would wait for the root's T2 timeout. The
+// same signed bytes are submitted again: never re-signed or rebuilt, so the root sees a repeat of the request it may already have, never a second request.
+const (
+	ResubmitMinInterval = 5 * time.Second // between two submissions of the same request
+	MaxResubmits        = 10              // re-sends of one request; counters start anew with every request
+)
+
+// resubmitPendingLocked is called with ucProcessingMutex held for a UC which is a duplicate of the held one, with the technical record tr. It reports whether it
+// submitted.
+func (c *BFTClientImpl) resubmitPendingLocked(ctx context.Context, uc *types.UnicityCertificate, luc *types.UnicityCertificate, tr *certification.TechnicalRecord) bool {
+	p := c.pending
+	if p == nil || c.proposedBlock == nil || tr == nil || luc == nil || p.req == nil {
+		return false
+	}
+	if uc.GetRoundNumber() != luc.GetRoundNumber() || uc.GetRootRoundNumber() != luc.GetRootRoundNumber() {
+		return false
+	}
+	if c.proposedBlock.Index == nil || c.proposedBlock.Index.Uint64() != p.round || p.round != tr.Round {
+		return false
+	}
+	now := c.clock()
+	if now.Sub(p.sentAt) < ResubmitMinInterval || p.resends >= MaxResubmits {
+		return false
+	}
+	p.resends++
+	p.sentAt = now
+	c.certRequestTime.Store(now.UnixNano())
+	c.logger.WithContext(ctx).Info("Re-submitting the pending certification request: the root repeats the UC and still waits for this round",
+		"round", p.round, "attempt", p.resends)
+	if err := c.submit(ctx, p.req, luc); err != nil {
+		metrics.BFTErrorsTotal.Inc()
+		c.logger.WithContext(ctx).Warn("Re-submitting the pending certification request failed", "round", p.round, "error", err.Error())
+		return false
+	}
+	return true
+}
+
 func (c *BFTClientImpl) resumeDurableProposalLocked(ctx context.Context, roundNumber *api.BigInt) (bool, error) {
 	loader, ok := c.roundManager.(DurableProposalLoader)
 	if !ok {
@@ -1362,6 +1416,33 @@ func (c *BFTClientImpl) sendCertificationRequest(ctx context.Context, rootHash s
 	c.logger.WithContext(ctx).Info(fmt.Sprintf("Round %d sending block certification request to root chain, IR hash %X",
 		req.InputRecord.RoundNumber, req.InputRecord.Hash))
 
+	c.pending = &pendingRequest{round: roundNumber, req: req, sentAt: c.clock()}
+	return c.submit(ctx, req, luc)
+}
+
+// submit hands the signed request to the root nodes of the committee of luc.
+func (c *BFTClientImpl) submit(ctx context.Context, req *certification.BlockCertificationRequest, luc *types.UnicityCertificate) error {
+	deliver := c.deliver
+	if deliver != nil {
+		return deliver(ctx, req, luc)
+	}
+	return c.submitSigned(ctx, req, luc)
+}
+
+func (c *BFTClientImpl) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+func (c *BFTClientImpl) submitSigned(ctx context.Context, req *certification.BlockCertificationRequest, luc *types.UnicityCertificate) error {
+	c.mu.Lock()
+	bftNetwork := c.network
+	c.mu.Unlock()
+	if bftNetwork == nil {
+		return errors.New("BFT client network is not initialized")
+	}
 	tb, err := c.authn.trustBase(ctx, luc.GetRootEpoch())
 	if err != nil {
 		return err
