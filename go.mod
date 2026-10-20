@@ -272,8 +272,8 @@ require (
 	rsc.io/tmplfunc v0.0.3 // indirect
 )
 
-// Provisional pins (bft-core sync draft PR #650, commit bbf89daad; re-pin when it merges): the bft-core with the signed trust-base history and the
-// combined 0.0.3 response, and the bft-go-base it pins.
-replace github.com/unicitynetwork/bft-core => github.com/ristik/bft-core v1.1.1-0.20261019192856-f4f324197c63
+// Pins: ristik/bft-core integration/enshrined-evm at the merge of the upstream sync (#650, 12f16641d), with the combined 0.0.3 response and the
+// signed trust-base history, and the bft-go-base it pins (bft-go-base#3, 8890ddce).
+replace github.com/unicitynetwork/bft-core => github.com/ristik/bft-core v1.1.1-0.20261020004441-12f16641d74f
 
-replace github.com/unicitynetwork/bft-go-base => github.com/ristik/bft-go-base v1.1.1-0.20261019185200-6174434eeb99
+replace github.com/unicitynetwork/bft-go-base => github.com/ristik/bft-go-base v1.1.1-0.20261019192807-8890ddce75de
