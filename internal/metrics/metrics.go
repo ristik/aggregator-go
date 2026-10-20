@@ -238,6 +238,15 @@ var (
 		[]string{"shard"},
 	)
 
+	// BFTStaleUCTotal counts authentic certificates the client had already moved past (a lagging root's answer); they are ignored.
+	BFTStaleUCTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "aggregator_bft_stale_uc_total",
+			Help: "Stale unicity certificates ignored (older than the held one), by shard.",
+		},
+		[]string{"shard"},
+	)
+
 	// BFTHandshakesTotal counts handshakes sent to the root; each may legitimately be answered by a
 	// re-delivery of the last certification response.
 	BFTHandshakesTotal = promauto.NewCounterVec(
