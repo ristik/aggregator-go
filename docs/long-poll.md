@@ -133,7 +133,7 @@ admitted the submission:
    next hop supports it, and never discover protocol support by replaying a request.
 8. **Do not cache.** Every JSON-RPC response carries `Cache-Control: no-store` (proof, status and error answers
    change over time). Pass `Retry-After` through; for browsers the aggregator exposes it
-   (`Access-Control-Expose-Headers`) and allows `Content-Type`, `Authorization`, `X-API-Key` and `X-State-ID`.
+   (`Access-Control-Expose-Headers`) and allows `Content-Type`, `Authorization`, `X-API-Key`, `X-State-ID` and `X-SDK-Version` (the SDKs' `<language>/<version>` label; a browser SDK must not send it to an aggregator whose preflight does not list it, and a proxy in front must list it too).
    CORS applies to the JSON-RPC route (`/`) only: its answers carry the headers and `ENABLE_CORS` (default on) answers the
    preflight with `GET, POST, OPTIONS`; `/health`,
    `/metrics`, the trust base routes and `/docs` carry no CORS headers. LB-generated errors need the same
