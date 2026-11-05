@@ -620,6 +620,29 @@ curl -X PUT -H 'Content-Type: application/json' -d @./bft-config/trust-base.json
 }
 ```
 
+#### `GET /api/v1/trustbases` with the Unicity Trust Base history (optional)
+
+By default `GET /api/v1/trustbases` answers with the version 1 trust bases (above). When a trust-base bundle is configured it answers with the signed
+Unicity Trust Base history (record version 2) instead; `PUT /api/v1/trustbases` and the aggregator's own trust base are not changed by this.
+
+| Variable | Meaning |
+| --- | --- |
+| `UTB_BUNDLE_FILE` | the release bundle, `unicity-trustbase.<network>.cbor` (tag 39015, complete history from the genesis) |
+| `UTB_GENESIS_ID` | `0x` + the genesis EntryID: the pin. It comes from your authenticated configuration; it is never computed from the file |
+| `UTB_EXPECTED_NETWORK` | the network the bundle must belong to. With BFT enabled it defaults to the shard configuration's network (and must equal it if set); without BFT it is required |
+
+Set both file and pin or neither. At start the file is read within a byte budget, decoded strictly, and verified completely (the genesis is the pin, every later entry is signed by a quorum of its predecessor's members), the network must be the configured one, and the history must agree with the trust base the aggregator holds: the active epoch must be covered and have the same network, start round, members (id, key, stake) and quorum threshold. Any failure stops the start; an invalid V2 configuration never falls back to the V1 trust bases.
+
+```
+GET /api/v1/trustbases?from=E[&to=E][&snapshotEnd=E&snapshotEntryId=0x..][&maxEntries=N]
+```
+
+The answer is `200 application/cbor`, the GetTrustBase response (tag 39015, `[version, network, status, fromEpoch, effectiveEnd, endEntryID, entries, nextEpoch]`), the same bytes a root peer sends. `from` defaults to the genesis epoch, an omitted or future `to` is the tip. A page holds at most 64 entries (`maxEntries` 1..64) and 1 MiB; a client continues with `nextEpoch` and echoes `(effectiveEnd, endEntryID)` as `snapshotEnd`/`snapshotEntryId`, so the end does not move. Protocol outcomes are the status inside the response: `NotYetAvailable` (`from` beyond the tip, or a replica behind the snapshot), `HistoryMismatch` (another entry at the snapshot epoch), `InvalidRequest`, `Unavailable` (see below). A malformed query (repeated or non-decimal fields, a half snapshot, `maxEntries` out of range, a query longer than 1 KiB) is `400`. Responses are `Cache-Control: no-store`. The request carries no network and no byte budget: clients compare the response's network with their own, and the page cap is fixed.
+
+The history is read once at start and does not change while the process runs. It is not a synchronised view of the roots, and a status or a tip is not authenticated freshness: a client verifies every entry from the entry it holds. `PUT` never updates the file and never turns a V1 trust base into a V2 entry. A new authority needs a verified complete replacement bundle and a restart. If the aggregator's active V1 trust base moves past what the file covers, or contradicts it, `GET` answers `Unavailable` and `/health` reports `degraded` (details `trustBaseV2`, and `trustBaseV2Tip` always shows the served tip). With several shards behind a gateway, every shard must run the same bundle and pin (the gateway sends this GET to any shard).
+
+With `ENABLE_CORS=true` the route and its preflight carry the JSON-RPC route's CORS headers (methods `GET, OPTIONS`), error responses included.
+
 #### `GET /docs`
 Returns **executable** interactive HTML API documentation page with live testing capabilities (if `ENABLE_DOCS=true`).
 

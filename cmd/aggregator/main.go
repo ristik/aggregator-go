@@ -28,6 +28,7 @@ import (
 	"github.com/unicitynetwork/aggregator-go/internal/storage"
 	"github.com/unicitynetwork/aggregator-go/internal/storage/interfaces"
 	"github.com/unicitynetwork/aggregator-go/internal/trustbase"
+	"github.com/unicitynetwork/aggregator-go/internal/trustbase/utb"
 	"github.com/unicitynetwork/aggregator-go/pkg/api"
 )
 
@@ -268,6 +269,20 @@ func main() {
 	// Initialize gateway server
 	server := gateway.NewServer(cfg, log, aggregatorService)
 	server.SetLongPoll(longPoll)
+
+	// The signed trust-base history (record version 2), when configured. An invalid configuration, or one that disagrees with the trust base the
+	// aggregator itself holds, stops the start; it never falls back to the version 1 trust bases.
+	if cfg.UTB.Enabled() {
+		guard, err := loadTrustBaseHistory(ctx, cfg, aggregatorService)
+		if err != nil {
+			log.WithComponent("main").Error("Trust-base history refused", "error", err.Error())
+			gracefulExit(asyncLogger, 1)
+		}
+		server.SetTrustBaseHistory(guard)
+		epoch, id := guard.History().Tip()
+		log.WithComponent("main").Info("Serving the trust-base history", "network", guard.History().Network(), "genesisEpoch", guard.History().GenesisEpoch(),
+			"tipEpoch", epoch, "tipEntryId", fmt.Sprintf("0x%x", id))
+	}
 
 	// get_inclusion_proofs.v1: served from the retained-view catalog, or explicitly
 	// unsupported (unsupported_configuration) when this deployment cannot serve it.
@@ -553,4 +568,25 @@ type leaderSelector interface {
 	Resign(ctx context.Context) error
 	Start(ctx context.Context)
 	Stop(ctx context.Context)
+}
+
+// loadTrustBaseHistory loads and verifies the configured bundle and checks it against the trust base the aggregator already holds.
+func loadTrustBaseHistory(ctx context.Context, cfg *config.Config, svc service.TrustBaseService) (*utb.Guard, error) {
+	pin, err := cfg.UTB.Pin()
+	if err != nil {
+		return nil, err
+	}
+	network, err := cfg.UTBNetwork()
+	if err != nil {
+		return nil, err
+	}
+	history, err := utb.Load(utb.LoadConfig{Path: cfg.UTB.BundleFile, Pin: pin, Network: network})
+	if err != nil {
+		return nil, err
+	}
+	guard := utb.NewGuard(history, svc.GetLatestTrustBase)
+	if err := guard.CheckInstalled(ctx, svc.GetTrustBases); err != nil {
+		return nil, err
+	}
+	return guard, nil
 }
