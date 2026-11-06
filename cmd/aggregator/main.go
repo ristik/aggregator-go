@@ -273,12 +273,13 @@ func main() {
 	// The signed trust-base history (record version 2), when configured. An invalid configuration, or one that disagrees with the trust base the
 	// aggregator itself holds, stops the start; it never falls back to the version 1 trust bases.
 	if cfg.UTB.Enabled() {
-		guard, err := loadTrustBaseHistory(ctx, cfg, aggregatorService)
+		guard, err := loadTrustBaseHistory(ctx, cfg, aggregatorService, storageInstance)
 		if err != nil {
 			log.WithComponent("main").Error("Trust-base history refused", "error", err.Error())
 			gracefulExit(asyncLogger, 1)
 		}
 		server.SetTrustBaseHistory(guard)
+		go refreshTrustBaseHistory(ctx, log, guard.History())
 		epoch, id := guard.History().Tip()
 		log.WithComponent("main").Info("Serving the trust-base history", "network", guard.History().Network(), "genesisEpoch", guard.History().GenesisEpoch(),
 			"tipEpoch", epoch, "tipEntryId", fmt.Sprintf("0x%x", id))
@@ -570,8 +571,13 @@ type leaderSelector interface {
 	Stop(ctx context.Context)
 }
 
-// loadTrustBaseHistory loads and verifies the configured bundle and checks it against the trust base the aggregator already holds.
-func loadTrustBaseHistory(ctx context.Context, cfg *config.Config, svc service.TrustBaseService) (*utb.Guard, error) {
+// trustBaseHistoryRefreshInterval is how often replicas sharing a database adopt the entries another one has persisted.
+const trustBaseHistoryRefreshInterval = 10 * time.Second
+
+// loadTrustBaseHistory opens the configured bundle together with the durable store, and checks the held history against the trust base the aggregator
+// already holds. The storage must offer a durable store: the history never runs memory-only, so a restart cannot fall back to a shorter one. An active
+// epoch the history does not cover yet is not an error (the aggregator starts, degraded, until an append covers it); a contradiction is.
+func loadTrustBaseHistory(ctx context.Context, cfg *config.Config, svc service.TrustBaseService, storage interface{}) (*utb.Guard, error) {
 	pin, err := cfg.UTB.Pin()
 	if err != nil {
 		return nil, err
@@ -580,7 +586,11 @@ func loadTrustBaseHistory(ctx context.Context, cfg *config.Config, svc service.T
 	if err != nil {
 		return nil, err
 	}
-	history, err := utb.Load(utb.LoadConfig{Path: cfg.UTB.BundleFile, Pin: pin, Network: network})
+	provider, ok := storage.(interface{ TrustBaseHistoryStore() utb.Store })
+	if !ok {
+		return nil, errors.New("the configured storage cannot persist the trust-base history; refusing to serve it from memory")
+	}
+	history, err := utb.Open(ctx, utb.LoadConfig{Path: cfg.UTB.BundleFile, Pin: pin, Network: network}, provider.TrustBaseHistoryStore())
 	if err != nil {
 		return nil, err
 	}
@@ -589,4 +599,23 @@ func loadTrustBaseHistory(ctx context.Context, cfg *config.Config, svc service.T
 		return nil, err
 	}
 	return guard, nil
+}
+
+// refreshTrustBaseHistory copies entries already persisted by another process sharing the database. It is not a source of new entries.
+func refreshTrustBaseHistory(ctx context.Context, log *logger.Logger, h *utb.History) {
+	t := time.NewTicker(trustBaseHistoryRefreshInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if n, err := h.Refresh(ctx); err != nil {
+				log.WithComponent("main").Error("Trust-base history refresh failed", "error", err.Error())
+			} else if n > 0 {
+				epoch, _ := h.Tip()
+				log.WithComponent("main").Info("Trust-base history extended from the shared store", "adopted", n, "tipEpoch", epoch)
+			}
+		}
+	}
 }

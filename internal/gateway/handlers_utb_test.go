@@ -48,6 +48,7 @@ type utbFixture struct {
 	svc   *utbService
 	chain *utbtest.Chain
 	hist  *utb.History
+	store *utbtest.MemStore
 }
 
 func newUTBFixture(t *testing.T, cors bool, members, epochs, file int) *utbFixture {
@@ -58,12 +59,13 @@ func newUTBFixture(t *testing.T, cors bool, members, epochs, file int) *utbFixtu
 	cfg.Server = config.ServerConfig{ConcurrencyLimit: 10, EnableCORS: cors}
 	cfg.Sharding.Mode = config.ShardingModeStandalone
 	chain := utbtest.NewChain(t, members, epochs, 0)
-	hist, err := utb.Load(utb.LoadConfig{Path: utbtest.WriteFile(t, "b.cbor", chain.Bundle(t, file)), Pin: chain.Pin(t), Network: utbtest.Network})
+	store := utbtest.NewMemStore()
+	hist, err := utb.Open(context.Background(), utb.LoadConfig{Path: utbtest.WriteFile(t, "b.cbor", chain.Bundle(t, file)), Pin: chain.Pin(t), Network: utbtest.Network}, store)
 	require.NoError(t, err)
 	svc := &utbService{}
 	srv := NewServer(cfg, log, svc)
 	srv.SetTrustBaseHistory(utb.NewGuard(hist, svc.GetLatestTrustBase))
-	return &utbFixture{srv: srv, svc: svc, chain: chain, hist: hist}
+	return &utbFixture{srv: srv, svc: svc, chain: chain, hist: hist, store: store}
 }
 
 func (f *utbFixture) do(method, target string) *httptest.ResponseRecorder {
@@ -171,7 +173,7 @@ func TestCORSOnTheTrustBaseRoute(t *testing.T) {
 	require.Equal(t, "GET, OPTIONS", rec.Header().Get("Access-Control-Allow-Methods"))
 	// the degraded answer carries them as well
 	on.svc.latest = on.chain.V1(3)
-	on.svc.latest.EpochStart++
+	on.svc.latest.EpochStart++ // a conflict
 	requireCORS(t, on.do(http.MethodGet, "/api/v1/trustbases").Header())
 
 	off := newUTBFixture(t, false, 4, 3, 3)
@@ -181,31 +183,53 @@ func TestCORSOnTheTrustBaseRoute(t *testing.T) {
 	}
 }
 
-func TestPutStaysAsItWasAndTheFileDoesNotFollowIt(t *testing.T) {
-	f := newUTBFixture(t, false, 4, 4, 3) // the file stops at epoch 3 while the chain goes on
+func TestPutStaysAsItWasAndTheHistoryGrowsOnlyByAppend(t *testing.T) {
+	f := newUTBFixture(t, false, 4, 5, 3) // the bundle stops at epoch 3 while the chain goes on
 	rec := httptest.NewRecorder()
 	f.srv.router.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/v1/trustbases", strings.NewReader("{")))
 	require.Equal(t, http.StatusBadRequest, rec.Code, "the V1 PUT handler still answers (malformed body)")
 
-	// the aggregator's active authority moves to epoch 4 (PUT or the BFT admission): the file cannot follow
+	// the aggregator's active authority moves to epoch 4 (PUT or the BFT admission): the held history is behind, not wrong. The verified prefix is
+	// served, NotYetAvailable beyond it, and readiness is degraded until an entry covers the epoch
 	f.svc.latest = f.chain.V1(4)
-	r, _ := f.page(t, "/api/v1/trustbases")
-	require.Equal(t, types.TrustBaseStatusUnavailable, r.Status, "not served while it disagrees with the active authority")
-	require.Empty(t, r.Entries)
-
-	health := f.do(http.MethodGet, "/health")
-	require.Equal(t, http.StatusOK, health.Code)
-	require.Contains(t, health.Body.String(), `"status":"degraded"`)
-	require.Contains(t, health.Body.String(), "trustBaseV2Tip")
-
-	// an authority the file covers is served again
-	f.svc.latest = f.chain.V1(3)
 	r, es := f.page(t, "/api/v1/trustbases")
 	require.Equal(t, types.TrustBaseStatusOK, r.Status)
 	require.Len(t, es, 3)
+	r, _ = f.page(t, "/api/v1/trustbases?from=4")
+	require.Equal(t, types.TrustBaseStatusNotYetAvailable, r.Status)
+	require.Equal(t, uint64(3), r.EffectiveEnd)
+	health := f.do(http.MethodGet, "/health")
+	require.Equal(t, http.StatusOK, health.Code)
+	require.Contains(t, health.Body.String(), `"status":"degraded"`)
+	require.Contains(t, health.Body.String(), "behind")
+	require.Contains(t, health.Body.String(), "trustBaseV2Tip")
+
+	// appending the entry restores readiness; no replacement bundle and no restart
+	_, err := f.hist.Append(context.Background(), f.chain.Raw[3])
+	require.NoError(t, err)
+	r, es = f.page(t, "/api/v1/trustbases?from=3")
+	require.Equal(t, types.TrustBaseStatusOK, r.Status)
+	require.Len(t, es, 2)
 	health = f.do(http.MethodGet, "/health")
 	require.Contains(t, health.Body.String(), `"status":"ok"`)
-	require.Contains(t, health.Body.String(), "epoch 3 entry 0x")
+	require.Contains(t, health.Body.String(), "epoch 4 entry 0x")
+
+	// a conflict with the aggregator's authority (same epoch, other start round) is not served
+	conflict := f.chain.V1(4)
+	conflict.EpochStart++
+	f.svc.latest = conflict
+	r, _ = f.page(t, "/api/v1/trustbases")
+	require.Equal(t, types.TrustBaseStatusUnavailable, r.Status)
+	require.Empty(t, r.Entries)
+	require.Contains(t, f.do(http.MethodGet, "/health").Body.String(), `"status":"degraded"`)
+
+	// a failed refresh is visible on the health check
+	f.svc.latest = f.chain.V1(4)
+	f.store.Corrupt(5, []byte{1})
+	require.NoError(t, f.store.Advance(context.Background(), 5, f.chain.ID(t, 5)))
+	_, err = f.hist.Refresh(context.Background())
+	require.Error(t, err)
+	require.Contains(t, f.do(http.MethodGet, "/health").Body.String(), "trustBaseV2Refresh")
 }
 
 func TestWithoutAHistoryTheRouteIsTheV1Route(t *testing.T) {

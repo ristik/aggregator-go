@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/unicitynetwork/bft-go-base/types"
@@ -66,7 +67,9 @@ func (s *Server) serveTrustBaseHistory(c *gin.Context) {
 		return
 	}
 	var resp *types.TrustBaseResponse
-	if err := s.utb.Check(ctx); err != nil {
+	// Behind (the active epoch is not in the held history yet) is not a fork: the verified prefix is served and NotYetAvailable says where it ends.
+	// Only a conflict with the aggregator's own authority, or a failure to tell, stops the answer.
+	if err := s.utb.Check(ctx); err != nil && !errors.Is(err, utb.ErrBehind) {
 		s.logger.WithContext(ctx).Error("GET trustbases: the V2 history is not served", "error", err.Error())
 		resp = h.Unavailable()
 	} else {
@@ -160,12 +163,22 @@ func (s *Server) trustBaseV2Health(c *gin.Context, status *api.HealthStatus) {
 	if s.utb == nil {
 		return
 	}
-	epoch, id := s.utb.History().Tip()
-	status.AddDetail("trustBaseV2Tip", fmt.Sprintf("epoch %d entry 0x%s", epoch, hex.EncodeToString(id[:])))
-	if err := s.utb.Check(c.Request.Context()); err != nil {
-		status.AddDetail("trustBaseV2", "not served: "+err.Error())
+	degrade := func(key, msg string) {
+		status.AddDetail(key, msg)
 		if status.Status == api.HealthStatusOk {
 			status.Status = api.HealthStatusDegraded
 		}
+	}
+	epoch, id := s.utb.History().Tip()
+	status.AddDetail("trustBaseV2Tip", fmt.Sprintf("epoch %d entry 0x%s", epoch, hex.EncodeToString(id[:])))
+	switch err := s.utb.Check(c.Request.Context()); {
+	case err == nil:
+	case errors.Is(err, utb.ErrBehind):
+		degrade("trustBaseV2", "behind, serving the verified prefix: "+err.Error())
+	default:
+		degrade("trustBaseV2", "not served: "+err.Error())
+	}
+	if err, at := s.utb.History().Status(); err != nil {
+		degrade("trustBaseV2Refresh", fmt.Sprintf("failed at %s: %v", at.UTC().Format(time.RFC3339), err))
 	}
 }
