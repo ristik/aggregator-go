@@ -161,6 +161,9 @@ func Open(ctx context.Context, cfg LoadConfig, store Store) (*History, error) {
 	}
 	present := map[uint64]bool{}
 	for _, raw := range stored {
+		if len(raw) > types.MaxTrustBaseEntryBytes {
+			return nil, fmt.Errorf("%w: a stored entry of %d bytes exceeds the cap of %d", ErrStore, len(raw), types.MaxTrustBaseEntryBytes)
+		}
 		e, err := types.DecodeRootTrustBaseV2(raw)
 		if err != nil {
 			return nil, fmt.Errorf("%w: a stored entry does not decode: %v", ErrStore, err)
@@ -189,7 +192,7 @@ func Open(ctx context.Context, cfg LoadConfig, store Store) (*History, error) {
 	}
 	tipEpoch := h.entries[len(h.entries)-1].Epoch
 	if meta.TipEpoch != 0 {
-		if meta.TipEpoch > tipEpoch || h.ids[meta.TipEpoch-h.genesis] != meta.TipID {
+		if meta.TipEpoch < h.genesis || meta.TipEpoch > tipEpoch || h.ids[meta.TipEpoch-h.genesis] != meta.TipID {
 			return nil, fmt.Errorf("%w: the store acknowledged epoch %d but holds a shorter or different history (missing or corrupt tail)", ErrStore, meta.TipEpoch)
 		}
 	}
@@ -231,6 +234,10 @@ func (h *History) verifyNext(e *types.RootTrustBaseV2, _ [types.TrustBaseV2IDLen
 func (h *History) Append(ctx context.Context, raw []byte) (Outcome, error) {
 	h.wmu.Lock()
 	defer h.wmu.Unlock()
+	// A page refuses an entry over this size, so a stored one would make every page that reaches it undecodable for the clients, for good.
+	if len(raw) > types.MaxTrustBaseEntryBytes {
+		return 0, fmt.Errorf("%w: entry of %d bytes, the cap is %d", ErrChain, len(raw), types.MaxTrustBaseEntryBytes)
+	}
 	e, err := types.DecodeRootTrustBaseV2(raw)
 	if err != nil {
 		return 0, fmt.Errorf("%w: %v", ErrChain, err)
@@ -324,6 +331,9 @@ func (h *History) Refresh(ctx context.Context) (adopted int, err error) {
 		return 0, fmt.Errorf("%w: reading the store: %w", ErrStore, err)
 	}
 	for _, raw := range stored {
+		if len(raw) > types.MaxTrustBaseEntryBytes {
+			return adopted, fmt.Errorf("%w: a stored entry of %d bytes exceeds the cap of %d", ErrStore, len(raw), types.MaxTrustBaseEntryBytes)
+		}
 		e, derr := types.DecodeRootTrustBaseV2(raw)
 		if derr != nil {
 			return adopted, fmt.Errorf("%w: a stored entry does not decode: %v", ErrStore, derr)

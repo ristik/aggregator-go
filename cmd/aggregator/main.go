@@ -27,6 +27,7 @@ import (
 	"github.com/unicitynetwork/aggregator-go/internal/smt"
 	"github.com/unicitynetwork/aggregator-go/internal/storage"
 	"github.com/unicitynetwork/aggregator-go/internal/storage/interfaces"
+	"github.com/unicitynetwork/aggregator-go/internal/storage/mongodb"
 	"github.com/unicitynetwork/aggregator-go/internal/trustbase"
 	"github.com/unicitynetwork/aggregator-go/internal/trustbase/utb"
 	"github.com/unicitynetwork/aggregator-go/pkg/api"
@@ -570,6 +571,9 @@ type leaderSelector interface {
 	Start(ctx context.Context)
 	Stop(ctx context.Context)
 }
+
+// The Mongo storage offers the durable trust-base history store; renaming the method would otherwise turn every V2 start into a refusal.
+var _ interface{ TrustBaseHistoryStore() utb.Store } = (*mongodb.Storage)(nil)
 
 // trustBaseHistoryRefreshInterval is how often replicas sharing a database adopt the entries another one has persisted.
 const trustBaseHistoryRefreshInterval = 10 * time.Second
