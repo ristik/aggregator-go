@@ -3,9 +3,12 @@ package gateway
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -261,4 +264,85 @@ func TestParseTrustBaseQueryDefaults(t *testing.T) {
 	q, err := parseTrustBaseQuery(&url.URL{}, 5)
 	require.NoError(t, err)
 	require.Equal(t, utb.Query{From: 5, MaxEntries: 64}, q)
+}
+
+// §49: the largest valid entry (256 members with 128-byte node ids, signed by all 256 predecessors; the shared bft-go-base fixture) through append,
+// persist, restart and the HTTP page, against an active authority of 256 members.
+func TestTheLargestValidEntryIsServedOverHTTPAfterAppendAndRestartAgainstItsAuthority(t *testing.T) {
+	data, err := os.ReadFile("../trustbase/utb/testdata/max-entry-v1.json")
+	require.NoError(t, err)
+	var fx struct {
+		Network   uint32 `json:"network"`
+		Genesis   string `json:"genesis"`
+		GenesisID string `json:"genesisId"`
+		Entry     string `json:"entry"`
+	}
+	require.NoError(t, json.Unmarshal(data, &fx))
+	genesis, err := hex.DecodeString(fx.Genesis)
+	require.NoError(t, err)
+	entry, err := hex.DecodeString(fx.Entry)
+	require.NoError(t, err)
+	idb, err := hex.DecodeString(fx.GenesisID)
+	require.NoError(t, err)
+	var pin [32]byte
+	copy(pin[:], idb)
+	bundle, err := types.EncodeTrustBaseBundle([][]byte{genesis})
+	require.NoError(t, err)
+	cfgOf := utb.LoadConfig{Path: utbtest.WriteFile(t, "g.cbor", bundle), Pin: pin, Network: types.NetworkID(fx.Network)}
+
+	e2, err := types.DecodeRootTrustBaseV2(entry)
+	require.NoError(t, err)
+	require.Len(t, e2.RootNodes, 256)
+	// the aggregator's active authority is epoch 2 with the same 256 members
+	v1 := &types.RootTrustBaseV1{Version: 1, NetworkID: e2.NetworkID, Epoch: e2.Epoch, EpochStart: e2.EpochStart, RootNodes: e2.RootNodes,
+		QuorumThreshold: e2.QuorumThreshold}
+
+	ctx := context.Background()
+	store := utbtest.NewMemStore()
+	hist, err := utb.Open(ctx, cfgOf, store)
+	require.NoError(t, err)
+	_, err = hist.Append(ctx, entry)
+	require.NoError(t, err)
+	// restart: a new process, the genesis-only bundle, the same store
+	restarted, err := utb.Open(ctx, cfgOf, store)
+	require.NoError(t, err)
+
+	log, err := logger.New("error", "text", "stdout", false)
+	require.NoError(t, err)
+	cfg := &config.Config{}
+	cfg.Server = config.ServerConfig{ConcurrencyLimit: 10}
+	cfg.Sharding.Mode = config.ShardingModeStandalone
+	svc := &utbService{latest: v1}
+	srv := NewServer(cfg, log, svc)
+	srv.SetTrustBaseHistory(utb.NewGuard(restarted, svc.GetLatestTrustBase))
+	f := &utbFixture{srv: srv, svc: svc}
+
+	r, es := f.page(t, "/api/v1/trustbases")
+	require.Equal(t, types.TrustBaseStatusOK, r.Status)
+	require.Len(t, es, 2)
+	require.Equal(t, entry, []byte(r.Entries[1]), "the stored bytes of the largest entry")
+	r, es = f.page(t, "/api/v1/trustbases?from=2")
+	require.Len(t, es, 1)
+	require.Len(t, es[0].RootNodes, 256)
+	require.Contains(t, f.do(http.MethodGet, "/health").Body.String(), `"status":"ok"`, "the held history covers and matches the active 256-member authority")
+}
+
+// §49: 257 members are over the native ceiling: the entry does not decode, so it is never appended.
+func TestAnEntryOf257MembersIsRefused(t *testing.T) {
+	c := utbtest.NewChain(t, 4, 2, 0)
+	h, err := utb.Open(context.Background(), utb.LoadConfig{Path: utbtest.WriteFile(t, "b.cbor", c.Bundle(t, 1)), Pin: c.Pin(t), Network: utbtest.Network}, utbtest.NewMemStore())
+	require.NoError(t, err)
+	big := c.Entries[1]
+	var nodes []*types.NodeInfo
+	for i := 0; i < 257; i++ {
+		nodes = append(nodes, &types.NodeInfo{NodeID: fmt.Sprintf("m%03d", i), SigKey: c.Entries[0].RootNodes[0].SigKey, Stake: 1})
+	}
+	big.RootNodes = nodes
+	big.QuorumThreshold = 172
+	raw, err := big.MarshalCBOR()
+	t.Logf("encoding 257 members: err=%v, %d bytes", err, len(raw))
+	require.NoError(t, err, "the type encodes it; it is the decoder that refuses")
+	_, err = h.Append(context.Background(), raw)
+	require.ErrorIs(t, err, utb.ErrChain)
+	require.Contains(t, err.Error(), "members")
 }
