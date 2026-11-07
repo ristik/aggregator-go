@@ -81,10 +81,10 @@ func TestRespondReproducesTheSharedResponseVectorsByteForByte(t *testing.T) {
 	// what a static HTTP history cannot say: a WrongNetwork/LimitTooSmall/Busy answer (the query carries no network or byte budget and the page cap
 	// always fits an entry), an unchecked end id on a cursor page, a NotYetAvailable whose end is not below `from`, and advisory metadata on a mismatch
 	cannot := map[string]bool{
-		"status 2 (WrongNetwork), nothing else":                                                                            true,
-		"status 5 (LimitTooSmall), nothing else":                                                                           true,
-		"status 6 (Busy), nothing else":                                                                                    true,
-		"page 1 with an end id that matches nothing: the end id on a cursor page is not checked":                           true,
+		"status 2 (WrongNetwork), nothing else":                                                  true,
+		"status 5 (LimitTooSmall), nothing else":                                                 true,
+		"status 6 (Busy), nothing else":                                                          true,
+		"page 1 with an end id that matches nothing: the end id on a cursor page is not checked": true,
 		"status 3 NotYetAvailable: effective end not below from (inconsistent for a caller; still a well-formed response)": true,
 		"status 4 HistoryMismatch with advisory metadata":                                                                  true,
 	}
