@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/unicitynetwork/bft-core/gettrustbase"
 	"github.com/unicitynetwork/bft-core/network"
 	"github.com/unicitynetwork/bft-core/network/protocol/certification"
 	"github.com/unicitynetwork/bft-core/network/protocol/handshake"
@@ -85,6 +86,10 @@ type (
 		certRequestTime atomic.Int64
 
 		trustBaseStore TrustBaseStore
+		// utb is the signed trust-base history (record version 2); when set, certificates are authenticated from it and trustBaseStore is not used
+		utb UTBHistory
+		// trustBaseFetcher fetches GetTrustBase pages; nil means the libp2p client on this node's peer
+		trustBaseFetcher gettrustbase.Fetcher
 
 		// Trust base history for the certification intake (local reads only on the message path),
 		// the admitted root peer set, and the single background catch-up worker.
@@ -176,6 +181,11 @@ func NewBFTClient(
 		proofStaging:   proofmaterial.NewStaging(proofmaterial.DefaultStagingEntries),
 		published:      map[proofmaterial.Digest]bool{},
 	}
+	if p, ok := trustBaseStore.(utbHistoryProvider); ok && p.UTBHistory() != nil {
+		bftClient.utb = p.UTBHistory()
+		bftClient.authn = newHistoryAuthenticator(conf.ShardConf.NetworkID, utbAuthority{bftClient.utb})
+		bftClient.admittedHead.Store(bftClient.utbTip())
+	}
 	topo, err := proofTopologyFromConfig(conf)
 	if err != nil {
 		return nil, fmt.Errorf("invalid consolidation topology: %w", err)
@@ -210,12 +220,15 @@ func (c *BFTClientImpl) ensureIntake() {
 
 func (c *BFTClientImpl) initIntake() {
 	liveEpoch := c.luc.Load().GetRootEpoch()
-	if h, ok := c.trustBaseStore.(IntakeTrustBases); ok {
+	if c.utb != nil {
+		c.history = utbIntake{c}
+	} else if h, ok := c.trustBaseStore.(IntakeTrustBases); ok {
 		c.history = h
 	} else {
 		c.history = localHistory{c.trustBaseStore}
 	}
 	c.members = newMembership(c.history, liveEpoch)
+	c.members.headFallback = c.utb != nil
 	c.catchup = newCatchUp(c.history, c.logger)
 	c.catchup.onRun = func(ctx context.Context) {
 		// retry a failed publication whatever the head and the live epoch are
@@ -223,11 +236,7 @@ func (c *BFTClientImpl) initIntake() {
 			c.refreshMembership(ctx)
 		}
 	}
-	c.catchup.onAdmitted = func(ctx context.Context, epoch uint64) {
-		for cur := c.admittedHead.Load(); epoch > cur && !c.admittedHead.CompareAndSwap(cur, epoch); cur = c.admittedHead.Load() {
-		}
-		c.refreshMembership(ctx)
-	}
+	c.catchup.onAdmitted = func(ctx context.Context, epoch uint64) { c.noteAdmitted(ctx, epoch) }
 	c.catchup.onHead = func(ctx context.Context, head uint64) bool {
 		// the head moved without this worker (for example another HA node admitted an epoch)
 		for {
@@ -352,6 +361,9 @@ func (c *BFTClientImpl) Start(ctx context.Context) error {
 	// root key replacement while this node was down must not deadlock behind the peer filter)
 	c.catchup.Signal()
 	go c.catchup.Run(msgLoopCtx)
+	if c.utb != nil {
+		go c.runUTBPoll(msgLoopCtx, c.conf.UTBPollInterval)
+	}
 	go func() {
 		defer close(msgLoopDone)
 		c.logger.WithContext(ctx).Info("BFT client event loop started")
@@ -441,7 +453,7 @@ func (c *BFTClientImpl) sendHandshake(ctx context.Context, bftNetwork *BftNetwor
 	if head := c.admittedHead.Load(); head > rootEpoch {
 		rootEpoch = head
 	}
-	tb, err := c.authn.trustBase(ctx, rootEpoch)
+	tb, err := c.handshakeAuthority(ctx, rootEpoch)
 	if err != nil {
 		return err
 	}
@@ -450,6 +462,7 @@ func (c *BFTClientImpl) sendHandshake(ctx context.Context, bftNetwork *BftNetwor
 	if err != nil {
 		return fmt.Errorf("failed to select root nodes for handshake: %w", err)
 	}
+	rootIDs = c.withNewestCommittee(rootIDs, rootEpoch, randomPicker(defaultHandshakeNodes))
 	// A newly admitted epoch may not be active yet: also ask some roots of the live epoch.
 	if liveEpoch := c.luc.Load().GetRootEpoch(); liveEpoch != rootEpoch {
 		if liveTB, lerr := c.authn.trustBase(ctx, liveEpoch); lerr == nil {
@@ -537,6 +550,13 @@ func (c *BFTClientImpl) handleMessage(ctx context.Context, msg any) {
 			c.logger.WithContext(ctx).Error("error processing CertificationResponseV2 message", "error", err.Error())
 		}
 	default:
+		if cr, updates, ok := combinedFrom(msg); ok {
+			c.logger.WithContext(ctx).Info("received CertificationResponseV3", "trustBaseUpdates", len(updates))
+			if err := c.handleCombinedResponse(ctx, cr, updates); err != nil {
+				c.logger.WithContext(ctx).Error("error processing CertificationResponseV3 message", "error", err.Error())
+			}
+			return
+		}
 		c.logger.WithContext(ctx).Info("received unknown message")
 	}
 }
@@ -1337,6 +1357,7 @@ func (c *BFTClientImpl) sendCertificationRequest(ctx context.Context, rootHash s
 	if err != nil {
 		return fmt.Errorf("selecting root nodes: %w", err)
 	}
+	rootIDs = c.withNewestCommittee(rootIDs, luc.GetRootEpoch(), ucPicker(luc, defaultNofRootNodes))
 	return bftNetwork.Send(ctx, req, rootIDs...)
 }
 
