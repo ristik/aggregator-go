@@ -204,6 +204,9 @@ func buildManifest(files consolidationcorpus.Files, cases []manifestCase, aggreg
 			switch d.Path {
 			case "github.com/unicitynetwork/bft-go-base", "github.com/unicitynetwork/bft-core":
 				mods[d.Path] = d.Version
+				if d.Replace != nil && d.Replace.Version != "" {
+					mods[d.Path] = d.Replace.Version // the module the corpus was really generated with
+				}
 			}
 		}
 	}
