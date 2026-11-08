@@ -23,6 +23,8 @@ jobs:
 
   docker:
     needs: test
+    # Publish only from the upstream repository, never from a fork.
+    if: github.repository == 'unicitynetwork/aggregator-go'
     runs-on: ubuntu-latest
     permissions:
       contents: read
