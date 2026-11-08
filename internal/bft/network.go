@@ -110,7 +110,6 @@ func NewLibP2PNetwork(ctx context.Context, peer *network.Peer, logger *logger.Lo
 			AdmitPeer:      opts.AdmitPeer,
 			RevalidatePeer: opts.RevalidatePeer,
 		},
-		combinedReceiveProtocol(opts),
 	}
 	if err = n.RegisterReceiveProtocols(receiveProtocolDescriptions); err != nil {
 		return nil, fmt.Errorf("registering receive protocols: %w", err)

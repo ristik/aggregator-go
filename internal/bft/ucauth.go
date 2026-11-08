@@ -1,7 +1,6 @@
 package bft
 
 import (
-	"bytes"
 	"context"
 	"crypto"
 	"crypto/sha256"
@@ -30,13 +29,6 @@ import (
 type ucAuthenticator struct {
 	network types.NetworkID
 	store   TrustBaseStore
-	// hist, when set, is the signed trust-base history (record version 2) and replaces store: authorities are its held entries and nothing is fetched
-	// on the message path (the catch-up worker extends the history)
-	hist AuthorityHistory
-	// shardConfHash is the configuration hash this shard's certificates must commit to (nil:
-	// unchecked, tests only): a certificate that commits to another configuration is not this
-	// shard's.
-	shardConfHash []byte
 
 	mu    sync.Mutex
 	known map[[sha256.Size]byte]struct{}
@@ -58,36 +50,8 @@ type ucAuthenticator struct {
 }
 
 type authorityEntry struct {
-	tb     types.RootTrustBase
+	tb     *types.RootTrustBaseV1
 	digest [sha256.Size]byte
-}
-
-// AuthorityHistory is the local view of the signed trust-base history: the held entry of an epoch, never fetched. An unknown epoch is (nil, false, nil).
-type AuthorityHistory interface {
-	GetAdmittedAuthority(ctx context.Context, epoch uint64) (types.RootTrustBase, bool, error)
-}
-
-// authorityDigest identifies the authority content of a trust base for the memo of authenticated seals: the V1 hash, or the V2 EntryID (the hash of the
-// unsigned entry, so another valid witness of the same entry is the same authority).
-func authorityDigest(tb types.RootTrustBase) ([sha256.Size]byte, error) {
-	var d [sha256.Size]byte
-	switch t := tb.(type) {
-	case *types.RootTrustBaseV1:
-		h, err := t.Hash(crypto.SHA256)
-		if err != nil {
-			return d, err
-		}
-		copy(d[:], h)
-	case *types.RootTrustBaseV2:
-		id, err := t.EntryID()
-		if err != nil {
-			return d, err
-		}
-		d = id
-	default:
-		return d, fmt.Errorf("unsupported trust base type %T", tb)
-	}
-	return d, nil
 }
 
 const (
@@ -100,19 +64,6 @@ func newUCAuthenticator(network types.NetworkID, store TrustBaseStore) *ucAuthen
 		network: network, store: store, known: map[[sha256.Size]byte]struct{}{},
 		authorities: map[uint64]*authorityEntry{}, ends: map[uint64]uint64{},
 	}
-}
-
-// withShardConfHash pins the configuration hash the certificates of this shard must commit to.
-func (a *ucAuthenticator) withShardConfHash(h []byte) *ucAuthenticator {
-	a.shardConfHash = bytes.Clone(h)
-	return a
-}
-
-// newHistoryAuthenticator authenticates under the signed trust-base history.
-func newHistoryAuthenticator(network types.NetworkID, hist AuthorityHistory) *ucAuthenticator {
-	a := newUCAuthenticator(network, nil)
-	a.hist = hist
-	return a
 }
 
 // ErrEpochNotAdmitted: the epoch is not in the locally admitted trust base history (yet). It is not
@@ -130,30 +81,16 @@ func (a *ucAuthenticator) authority(ctx context.Context, epoch uint64, localOnly
 		return e, nil
 	}
 	a.authorityLoads.Add(1)
-	var tb types.RootTrustBase
+	var tb *types.RootTrustBaseV1
 	var err error
-	if a.hist != nil {
+	if h, ok := a.store.(AdmittedTrustBases); ok && localOnly {
 		var known bool
-		tb, known, err = a.hist.GetAdmittedAuthority(ctx, epoch)
+		tb, known, err = h.GetAdmitted(ctx, epoch)
 		if err == nil && !known {
 			return nil, fmt.Errorf("%w: epoch %d", ErrEpochNotAdmitted, epoch)
-		}
-	} else if h, ok := a.store.(AdmittedTrustBases); ok && localOnly {
-		var v1 *types.RootTrustBaseV1
-		var known bool
-		v1, known, err = h.GetAdmitted(ctx, epoch)
-		if err == nil && !known {
-			return nil, fmt.Errorf("%w: epoch %d", ErrEpochNotAdmitted, epoch)
-		}
-		if v1 != nil {
-			tb = v1
 		}
 	} else {
-		var v1 *types.RootTrustBaseV1
-		v1, err = a.store.GetByEpoch(ctx, epoch)
-		if v1 != nil {
-			tb = v1
-		}
+		tb, err = a.store.GetByEpoch(ctx, epoch)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to load trust base for epoch %d: %w", epoch, err)
@@ -167,11 +104,12 @@ func (a *ucAuthenticator) authority(ctx context.Context, epoch uint64, localOnly
 	if tb.GetNetworkID() != a.network {
 		return nil, fmt.Errorf("trust base of epoch %d is of network %d, configured network is %d", epoch, tb.GetNetworkID(), a.network)
 	}
-	digest, err := authorityDigest(tb)
+	tbHash, err := tb.Hash(crypto.SHA256)
 	if err != nil {
 		return nil, fmt.Errorf("hashing trust base: %w", err)
 	}
-	e = &authorityEntry{tb: tb, digest: digest}
+	e = &authorityEntry{tb: tb}
+	copy(e.digest[:], tbHash)
 	a.mu.Lock()
 	if len(a.authorities) >= maxCachedEpochs {
 		clear(a.authorities)
@@ -182,7 +120,7 @@ func (a *ucAuthenticator) authority(ctx context.Context, epoch uint64, localOnly
 }
 
 // trustBase resolves the trust base of exactly the requested epoch of the configured network.
-func (a *ucAuthenticator) trustBase(ctx context.Context, epoch uint64) (types.RootTrustBase, error) {
+func (a *ucAuthenticator) trustBase(ctx context.Context, epoch uint64) (*types.RootTrustBaseV1, error) {
 	e, err := a.authority(ctx, epoch, false)
 	if err != nil {
 		return nil, err
@@ -274,7 +212,7 @@ func (o *authOp) verifyUC(uc *types.UnicityCertificate, partition types.Partitio
 	if uc.UnicitySeal.NetworkID != a.network {
 		return fmt.Errorf("unicity seal is of network %d, configured network is %d", uc.UnicitySeal.NetworkID, a.network)
 	}
-	if err := uc.IsValid(partition, shard, a.shardConfHash); err != nil {
+	if err := uc.IsValid(partition, shard, nil); err != nil {
 		return fmt.Errorf("invalid unicity certificate: %w", err)
 	}
 	shardRoot, err := uc.ShardTreeCertificate.ComputeCertificateHash(uc.InputRecord, uc.TRHash, uc.ShardConfHash, crypto.SHA256)
@@ -323,17 +261,8 @@ func (a *ucAuthenticator) epochEnd(ctx context.Context, epoch uint64) (uint64, b
 
 func (a *ucAuthenticator) nextEpochStart(ctx context.Context, epoch uint64) (uint64, bool, error) {
 	a.historyLookups.Add(1)
-	var next types.RootTrustBase
-	if a.hist != nil {
-		tb, known, err := a.hist.GetAdmittedAuthority(ctx, epoch+1)
-		if err != nil {
-			return 0, false, err
-		}
-		if !known {
-			return 0, false, nil
-		}
-		next = tb
-	} else if h, ok := a.store.(AdmittedTrustBases); ok {
+	var next *types.RootTrustBaseV1
+	if h, ok := a.store.(AdmittedTrustBases); ok {
 		tb, known, err := h.GetAdmitted(ctx, epoch+1)
 		if err != nil {
 			return 0, false, err
@@ -341,9 +270,7 @@ func (a *ucAuthenticator) nextEpochStart(ctx context.Context, epoch uint64) (uin
 		if !known {
 			return 0, false, nil
 		}
-		if tb != nil {
-			next = tb
-		}
+		next = tb
 	} else {
 		tb, err := a.store.GetByEpoch(ctx, epoch+1)
 		if err != nil {
@@ -352,9 +279,7 @@ func (a *ucAuthenticator) nextEpochStart(ctx context.Context, epoch uint64) (uin
 			}
 			return 0, false, fmt.Errorf("failed to load trust base for epoch %d: %w", epoch+1, err)
 		}
-		if tb != nil {
-			next = tb
-		}
+		next = tb
 	}
 	if next == nil {
 		return 0, false, nil
