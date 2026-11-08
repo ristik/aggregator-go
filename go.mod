@@ -272,8 +272,8 @@ require (
 	rsc.io/tmplfunc v0.0.3 // indirect
 )
 
-// Pins: ristik/bft-core integration/enshrined-evm at the merge of the upstream sync (#650), advanced to the 256-member / 128 KiB entry profile (bft-core#944, #951; f38fe054), with the combined 0.0.3 response and the
+// Pins: ristik/bft-core integration/enshrined-evm at the merge of the upstream sync (#650), advanced to the 256-member / 128 KiB entry profile (bft-core#944, #951), with the bounded V2/V3 certification receive caps (bft-core#953; f94b4b41), with the combined 0.0.3 response and the
 // signed trust-base history, and the bft-go-base it pins (bft-go-base#3, 8890ddce).
-replace github.com/unicitynetwork/bft-core => github.com/ristik/bft-core v1.1.1-0.20261107232654-f38fe054a9f0
+replace github.com/unicitynetwork/bft-core => github.com/ristik/bft-core v1.1.1-0.20261107234634-f94b4b410059
 
 replace github.com/unicitynetwork/bft-go-base => github.com/ristik/bft-go-base v1.1.1-0.20261019192807-8890ddce75de
