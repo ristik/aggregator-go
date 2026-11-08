@@ -310,3 +310,35 @@ func TestOnlyOneCatchUpRunsAtATime(t *testing.T) {
 	require.Equal(t, 4, total[0]+total[1], "each entry is counted once, by the catch-up that appended it")
 	require.EqualValues(t, 5, tipOf(h))
 }
+
+// ingestingPeers appends one entry through Ingest while the first page is being served: a certification response landing during a catch-up.
+type ingestingPeers struct {
+	*peers
+	h     *utb.History
+	raw   []byte
+	once  sync.Once
+	added int
+}
+
+func (p *ingestingPeers) Page(ctx context.Context, id peer.ID, req *gettrustbase.Request) (*gettrustbase.Response, [][]byte, error) {
+	p.once.Do(func() {
+		added, _, err := p.h.Ingest(ctx, [][]byte{p.raw})
+		if err != nil {
+			panic(err)
+		}
+		p.added = added
+	})
+	return p.peers.Page(ctx, id, req)
+}
+
+func TestCatchUpCountsOnlyTheEntriesItAppended(t *testing.T) {
+	c := utbtest.NewChain(t, 4, 4, 0)
+	h := open(t, c, 1, utbtest.NewMemStore())
+	p := &ingestingPeers{peers: newPeers(t, 1, map[peer.ID]chainSource{"root": {c, 4}}), h: h, raw: c.Raw[1]}
+
+	added, err := h.CatchUp(ctx, p, []peer.ID{"root"}, nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, p.added, "the concurrent Ingest appended epoch 2")
+	require.EqualValues(t, 4, tipOf(h))
+	require.Equal(t, 2, added, "the catch-up appended epochs 3 and 4 only; the tip difference (3) would count epoch 2 twice across the two paths")
+}

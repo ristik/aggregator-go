@@ -74,6 +74,7 @@ type feedSink struct {
 	cancel context.CancelFunc
 	h      *History
 	local  error
+	added  int // entries this sync appended itself (an entry a concurrent Ingest appended first is not counted)
 }
 
 func (s *feedSink) Tip() utbstore.Tip {
@@ -91,24 +92,24 @@ func (s *feedSink) Append(raw []byte) (bool, error) {
 		}
 		return false, err
 	}
+	if out == Appended {
+		s.added++
+	}
 	return out == Appended, nil
 }
 
 // CatchUp fetches the entries after the held tip from the given root peers (GetTrustBase), up to epoch "to" when it is given, authenticating every entry
 // from the one before it. Authenticated prefixes are kept when a later page fails, and the range is never probed beyond what the peers serve from the held
-// tip. It returns how many entries were newly appended. One catch-up runs at a time. A failure of the local store is returned as ErrLocal.
+// tip. It returns how many entries this call newly appended (not those a concurrent Ingest appended). One catch-up runs at a time. A failure of the local store is returned as ErrLocal.
 func (h *History) CatchUp(ctx context.Context, f gettrustbase.Fetcher, peers []peer.ID, to *uint64) (int, error) {
 	h.syncMu.Lock()
 	defer h.syncMu.Unlock()
-	before, _ := h.Tip()
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	sink := &feedSink{ctx: sctx, cancel: cancel, h: h}
 	_, err := gettrustbase.Sync(sctx, f, sink, peers, gettrustbase.SyncOptions{Network: h.network, To: to})
-	after, _ := h.Tip()
-	added := int(after - before)
 	if sink.local != nil {
-		return added, sink.local
+		return sink.added, sink.local
 	}
-	return added, err
+	return sink.added, err
 }
