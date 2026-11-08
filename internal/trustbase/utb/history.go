@@ -39,6 +39,9 @@ var (
 	ErrConflict = errors.New("a different trust-base entry is held for the epoch")
 	ErrGap      = errors.New("trust-base entry is ahead of the next epoch")
 	ErrChain    = errors.New("trust-base entry does not extend the held history")
+	// ErrPersist: the local durable store failed while writing a verified entry (nothing was published). It is this process's fault, never the fault of the
+	// peer that supplied the entry.
+	ErrPersist = errors.New("trust-base store write failed")
 )
 
 // Outcome of Append.
@@ -71,6 +74,8 @@ type History struct {
 	store   Store
 
 	wmu sync.Mutex // serialises Append and Refresh
+
+	syncMu sync.Mutex // one catch-up at a time (feed.go)
 
 	mu      sync.RWMutex // guards the slices (append-only) and the refresh status
 	raw     [][]byte
@@ -298,10 +303,10 @@ func (h *History) Append(ctx context.Context, raw []byte) (Outcome, error) {
 		}
 		raw, e = stored, se
 	default:
-		return 0, fmt.Errorf("persisting epoch %d: %w", e.Epoch, err)
+		return 0, fmt.Errorf("%w: persisting epoch %d: %w", ErrPersist, e.Epoch, err)
 	}
 	if err := h.store.Advance(ctx, e.Epoch, id); err != nil {
-		return 0, fmt.Errorf("advancing the stored tip to epoch %d: %w", e.Epoch, err)
+		return 0, fmt.Errorf("%w: advancing the stored tip to epoch %d: %w", ErrPersist, e.Epoch, err)
 	}
 	h.publish(raw, e, id)
 	return Appended, nil
