@@ -584,10 +584,8 @@ github.com/raulk/go-watchdog v1.3.0 h1:oUmdlHxdkXRJlwfG0O9omj8ukerm8MEQavSiDTEtB
 github.com/raulk/go-watchdog v1.3.0/go.mod h1:fIvOnLbF0b0ZwkB9YU4mOW9Did//4vPZtDqv66NfsMU=
 github.com/redis/go-redis/v9 v9.14.0 h1:u4tNCjXOyzfgeLN+vAZaW1xUooqWDqVEsZN0U01jfAE=
 github.com/redis/go-redis/v9 v9.14.0/go.mod h1:huWgSWd8mW6+m0VPhJjSSQ+d6Nh1VICQ6Q5lHuCH/Iw=
-github.com/ristik/bft-core v1.1.1-0.20261107234634-f94b4b410059 h1:8/XqiE6tBO2x3LsIHaERbt59XJ/H1BhI7pKaFOnRWf4=
-github.com/ristik/bft-core v1.1.1-0.20261107234634-f94b4b410059/go.mod h1:f1UC+UMtjtkyoaxNAih1SkWw8r5ZWq5jswSult8j1Xg=
-github.com/ristik/bft-go-base v1.1.1-0.20261107183428-81ee667315cb h1:/ny85niNPP8mJIdSqwDNvpC+khNnKBX9a0+0vv6Aqb4=
-github.com/ristik/bft-go-base v1.1.1-0.20261107183428-81ee667315cb/go.mod h1:hBnOG52VRy/vpgIBUulTgk7PBTwODZ2xkVjCEu5yRcQ=
+github.com/ristik/bft-core v1.1.1-0.20261109164040-53be38dab1f2 h1:4viMTpphzywYQiyVguT4BADHugIIbKip2v1Zt/rCuiU=
+github.com/ristik/bft-core v1.1.1-0.20261109164040-53be38dab1f2/go.mod h1:Heox7Y/c9CSDqY3M7Z5fPnzvMOjGIpO2Ni6Ob5TCq0Q=
 github.com/rivo/uniseg v0.2.0 h1:S1pD9weZBuJdFmowNwbpi7BJ8TNftyUImj/0WQi72jY=
 github.com/rivo/uniseg v0.2.0/go.mod h1:J6wj4VEh+S6ZtnVlnTBMWIodfgj8LQOQFoIToxlJtxc=
 github.com/rogpeppe/go-internal v1.9.0/go.mod h1:WtVeX8xhTBvf0smdhujwtBcq4Qrzq/fJaraNFVN+nFs=
@@ -694,6 +692,8 @@ github.com/tyler-smith/go-bip39 v1.1.0 h1:5eUemwrMargf3BSLRRCalXT93Ns6pQJIjYQN2n
 github.com/tyler-smith/go-bip39 v1.1.0/go.mod h1:gUYDtqQw1JS3ZJ8UWVcGTGqqr6YIN3CWg+kkNaLt55U=
 github.com/ugorji/go/codec v1.2.12 h1:9LC83zGrHhuUA9l16C9AHXAqEV/2wBQ4nkvumAE65EE=
 github.com/ugorji/go/codec v1.2.12/go.mod h1:UNopzCgEMSXjBc6AOMqYvWC1ktqTAfzJZUZgYf6w6lg=
+github.com/unicitynetwork/bft-go-base v1.1.1-0.20261109140746-dbf94198f25e h1:beKihHWbk3Id4vEuQumepMj7pGXBBaWfou0DDo2Dvec=
+github.com/unicitynetwork/bft-go-base v1.1.1-0.20261109140746-dbf94198f25e/go.mod h1:hBnOG52VRy/vpgIBUulTgk7PBTwODZ2xkVjCEu5yRcQ=
 github.com/urfave/cli v1.22.2/go.mod h1:Gos4lmkARVdJ6EkW0WaNv/tZAAMe9V7XWyB60NtXRu0=
 github.com/urfave/cli v1.22.10/go.mod h1:Gos4lmkARVdJ6EkW0WaNv/tZAAMe9V7XWyB60NtXRu0=
 github.com/viant/assertly v0.4.8/go.mod h1:aGifi++jvCrUaklKEKT0BU95igDNaqkvz+49uaYMPRU=

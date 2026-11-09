@@ -18,7 +18,7 @@ import (
 // Fetcher answers GetTrustBase pages with a server in process (the libp2p stream is bft-core's).
 type Fetcher struct{ Srv *gettrustbase.Server }
 
-func (f *Fetcher) Page(_ context.Context, _ peer.ID, req *gettrustbase.Request) (*gettrustbase.Response, [][]byte, error) {
+func (f *Fetcher) Page(_ context.Context, _ peer.ID, req *gettrustbase.Request) (*types.TrustBaseResponse, [][]byte, error) {
 	resp := f.Srv.Respond(req)
 	out := make([][]byte, len(resp.Entries))
 	for i, e := range resp.Entries {

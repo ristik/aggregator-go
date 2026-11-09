@@ -78,7 +78,7 @@ func newPeers(t *testing.T, maxEntries int, byID map[peer.ID]chainSource) *peers
 	return p
 }
 
-func (p *peers) Page(_ context.Context, id peer.ID, req *gettrustbase.Request) (*gettrustbase.Response, [][]byte, error) {
+func (p *peers) Page(_ context.Context, id peer.ID, req *gettrustbase.Request) (*types.TrustBaseResponse, [][]byte, error) {
 	p.mu.Lock()
 	p.calls, p.reqs = append(p.calls, id), append(p.reqs, req)
 	p.mu.Unlock()
@@ -280,7 +280,7 @@ type slowPeers struct {
 	max      int
 }
 
-func (p *slowPeers) Page(ctx context.Context, id peer.ID, req *gettrustbase.Request) (*gettrustbase.Response, [][]byte, error) {
+func (p *slowPeers) Page(ctx context.Context, id peer.ID, req *gettrustbase.Request) (*types.TrustBaseResponse, [][]byte, error) {
 	p.mu.Lock()
 	p.inFlight++
 	if p.inFlight > p.max {
@@ -322,7 +322,7 @@ type ingestingPeers struct {
 	added int
 }
 
-func (p *ingestingPeers) Page(ctx context.Context, id peer.ID, req *gettrustbase.Request) (*gettrustbase.Response, [][]byte, error) {
+func (p *ingestingPeers) Page(ctx context.Context, id peer.ID, req *gettrustbase.Request) (*types.TrustBaseResponse, [][]byte, error) {
 	p.once.Do(func() {
 		added, _, err := p.h.Ingest(ctx, [][]byte{p.raw})
 		if err != nil {

@@ -16,7 +16,7 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/mongodb v0.39.0
 	github.com/testcontainers/testcontainers-go/modules/redis v0.40.0
 	github.com/unicitynetwork/bft-core v1.1.1-0.20261019010732-0800b70ef621
-	github.com/unicitynetwork/bft-go-base v1.1.1-0.20261018233336-465dccf17fba
+	github.com/unicitynetwork/bft-go-base v1.1.1-0.20261109140746-dbf94198f25e
 	go.mongodb.org/mongo-driver v1.17.4
 	go.opentelemetry.io/otel/metric v1.38.0
 	go.opentelemetry.io/otel/trace v1.38.0
@@ -272,8 +272,6 @@ require (
 	rsc.io/tmplfunc v0.0.3 // indirect
 )
 
-// Pins: ristik/bft-core integration/enshrined-evm at the merge of the upstream sync (#650), advanced to the 256-member / 128 KiB entry profile (bft-core#944, #951), with the bounded V2/V3 certification receive caps (bft-core#953; f94b4b41), with the combined 0.0.3 response and the
-// signed trust-base history. bft-go-base: ristik/bft-go-base 81ee667 (the shared trust-base bundle and response codecs, bft-go-base#20's content), which the staging line and the UTB v2 packages both build against.
-replace github.com/unicitynetwork/bft-core => github.com/ristik/bft-core v1.1.1-0.20261107234634-f94b4b410059
-
-replace github.com/unicitynetwork/bft-go-base => github.com/ristik/bft-go-base v1.1.1-0.20261107183428-81ee667315cb
+// Pin: ristik/bft-core integration/enshrined-evm at the merge of bft-core#1001 (53be38da: gettrustbase uses bft-go-base's response and bundle code). bft-go-base is
+// the upstream module, unreplaced, at the merged dbf94198 (#20).
+replace github.com/unicitynetwork/bft-core => github.com/ristik/bft-core v1.1.1-0.20261109164040-53be38dab1f2

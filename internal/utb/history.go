@@ -68,17 +68,17 @@ func Open(bundleFile, genesisFile, pinHex, dbFile string) (*History, error) {
 		if err != nil {
 			return nil, fmt.Errorf("reading the trust-base genesis entry: %w", err)
 		}
-		if data, err = gettrustbase.EncodeBundle([][]byte{raw}); err != nil {
+		if data, err = types.EncodeTrustBaseBundle([][]byte{raw}); err != nil {
 			return nil, fmt.Errorf("the trust-base genesis entry: %w", err)
 		}
 	default:
 		return nil, errors.New("a trust-base bundle or genesis entry is required")
 	}
-	bundle, err := gettrustbase.DecodeBundle(data, gettrustbase.BundleLimits{MaxBytes: maxBundleBytes, MaxEntries: maxBundleEntries})
+	bundle, err := types.DecodeTrustBaseBundle(data, types.TrustBaseLimits{MaxBytes: maxBundleBytes, MaxEntries: maxBundleEntries})
 	if err != nil {
 		return nil, fmt.Errorf("decoding the trust-base bundle: %w", err)
 	}
-	if err := gettrustbase.VerifyBundle(bundle, pin); err != nil {
+	if err := types.VerifyTrustBaseBundle(bundle, pin); err != nil {
 		return nil, fmt.Errorf("verifying the trust-base bundle: %w", err)
 	}
 	db, err := boltdb.New(dbFile)
@@ -94,7 +94,7 @@ func Open(bundleFile, genesisFile, pinHex, dbFile string) (*History, error) {
 	return h, nil
 }
 
-func open(db keyvaluedb.KeyValueDB, bundle *gettrustbase.Bundle, pin [types.TrustBaseV2IDLen]byte) (*History, error) {
+func open(db keyvaluedb.KeyValueDB, bundle *types.TrustBaseBundle, pin [types.TrustBaseV2IDLen]byte) (*History, error) {
 	store, err := utbstore.Open(db, bundle.Entries[0], pin)
 	if err != nil {
 		return nil, fmt.Errorf("opening the trust-base store: %w", err)

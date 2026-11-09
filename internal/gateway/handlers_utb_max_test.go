@@ -61,9 +61,9 @@ func TestMaximumCommitteeAppendPersistRestartServe(t *testing.T) {
 	hf := getTrustBaseHistoryHandler(log, srv, h.Network(), h.GenesisEpoch())
 	res, body := doRequest(t, hf, http.MethodGet, "/api/v1/trustbases")
 	require.Equal(t, http.StatusOK, res.StatusCode)
-	resp, _, err := gettrustbase.DecodeResponse(body, gettrustbase.PageLimits)
+	resp, _, err := types.DecodeTrustBaseResponse(body, types.TrustBasePageLimits)
 	require.NoError(t, err)
-	require.Equal(t, gettrustbase.StatusOK, resp.Status)
+	require.Equal(t, types.TrustBaseStatusOK, resp.Status)
 	require.Len(t, resp.Entries, 2)
 	// The served bytes are the stored signed entry: the same entry id and all 256 predecessor signatures (the signature map's encoding order is not
 	// part of the id).

@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/unicitynetwork/bft-go-base/types"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -36,7 +37,7 @@ func history(t *testing.T) (*utb.History, []string) {
 		require.NoError(t, err)
 		entries = append(entries, b)
 	}
-	file, err := gettrustbase.EncodeBundle(entries)
+	file, err := types.EncodeTrustBaseBundle(entries)
 	require.NoError(t, err)
 	dir := t.TempDir()
 	bundle := filepath.Join(dir, "bundle.cbor")
@@ -56,18 +57,18 @@ func TestTrustBaseHistoryRange(t *testing.T) {
 	require.NoError(t, err)
 	hf := getTrustBaseHistoryHandler(log, srv, h.Network(), h.GenesisEpoch())
 
-	get := func(query string) *gettrustbase.Response {
+	get := func(query string) *types.TrustBaseResponse {
 		t.Helper()
 		res, body := doRequest(t, hf, http.MethodGet, "/api/v1/trustbases"+query)
 		require.Equal(t, http.StatusOK, res.StatusCode)
 		require.Equal(t, "application/cbor", res.Header.Get("Content-Type"))
-		resp, _, err := gettrustbase.DecodeResponse(body, gettrustbase.PageLimits) // the PR6 codec, strictly
+		resp, _, err := types.DecodeTrustBaseResponse(body, types.TrustBasePageLimits) // the PR6 codec, strictly
 		require.NoError(t, err)
 		return resp
 	}
 
 	all := get("") // from the genesis
-	require.Equal(t, gettrustbase.StatusOK, all.Status)
+	require.Equal(t, types.TrustBaseStatusOK, all.Status)
 	require.Len(t, all.Entries, 4)
 	for i, e := range all.Entries {
 		require.Equal(t, entries[i], hex.EncodeToString(e)) // the stored signed bytes, verbatim
@@ -84,11 +85,11 @@ func TestTrustBaseHistoryRange(t *testing.T) {
 	require.NotNil(t, page.NextEpoch)
 	require.Equal(t, uint64(3), *page.NextEpoch)
 	next := get(fmt.Sprintf("?from=3&maxEntries=1&snapshotEnd=%d&snapshotEntryId=0x%x", page.EffectiveEnd, page.EndEntryID))
-	require.Equal(t, gettrustbase.StatusOK, next.Status)
+	require.Equal(t, types.TrustBaseStatusOK, next.Status)
 	require.Equal(t, entries[2], hex.EncodeToString(next.Entries[0]))
 
-	require.Equal(t, gettrustbase.StatusNotYetAvailable, get("?from=5").Status)
-	require.Equal(t, gettrustbase.StatusHistoryMismatch, get("?from=3&snapshotEnd=4&snapshotEntryId=0x"+fmt.Sprintf("%064x", 1)).Status)
+	require.Equal(t, types.TrustBaseStatusNotYetAvailable, get("?from=5").Status)
+	require.Equal(t, types.TrustBaseStatusHistoryMismatch, get("?from=3&snapshotEnd=4&snapshotEntryId=0x"+fmt.Sprintf("%064x", 1)).Status)
 
 	for _, q := range []string{"?from=x", "?to=-1", "?maxEntries=0", "?maxEntries=65", "?snapshotEntryId=zz"} {
 		res, _ := doRequest(t, hf, http.MethodGet, "/api/v1/trustbases"+q)
@@ -113,7 +114,7 @@ func TestTrustBaseHistoryHasNoPut(t *testing.T) {
 	rec = httptest.NewRecorder()
 	s.router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/trustbases?from=4", nil))
 	require.Equal(t, http.StatusOK, rec.Code)
-	resp, _, err := gettrustbase.DecodeResponse(rec.Body.Bytes(), gettrustbase.PageLimits)
+	resp, _, err := types.DecodeTrustBaseResponse(rec.Body.Bytes(), types.TrustBasePageLimits)
 	require.NoError(t, err)
 	require.Len(t, resp.Entries, 1)
 }

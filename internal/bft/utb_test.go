@@ -43,7 +43,7 @@ func threeEpochs(t *testing.T, partition types.PartitionID) (*BFTClientImpl, *ut
 	dir := t.TempDir()
 	genesis := filepath.Join(dir, "genesis.cbor")
 	require.NoError(t, os.WriteFile(genesis, graw, 0o600))
-	bundle, err := gettrustbase.EncodeBundle([][]byte{graw, e2raw, e3raw})
+	bundle, err := types.EncodeTrustBaseBundle([][]byte{graw, e2raw, e3raw})
 	require.NoError(t, err)
 	bundleFile := filepath.Join(dir, "root.cbor")
 	require.NoError(t, os.WriteFile(bundleFile, bundle, 0o600))
@@ -69,7 +69,7 @@ type countingFetcher struct {
 	calls int
 }
 
-func (f *countingFetcher) Page(ctx context.Context, id peer.ID, r *gettrustbase.Request) (*gettrustbase.Response, [][]byte, error) {
+func (f *countingFetcher) Page(ctx context.Context, id peer.ID, r *gettrustbase.Request) (*types.TrustBaseResponse, [][]byte, error) {
 	f.calls++
 	return f.inner.Page(ctx, id, r)
 }

@@ -184,7 +184,7 @@ type loggingFetcher struct {
 	c *BFTClientImpl
 }
 
-func (l *loggingFetcher) Page(ctx context.Context, id peer.ID, req *gettrustbase.Request) (*gettrustbase.Response, [][]byte, error) {
+func (l *loggingFetcher) Page(ctx context.Context, id peer.ID, req *gettrustbase.Request) (*types.TrustBaseResponse, [][]byte, error) {
 	resp, entries, err := l.f.Page(ctx, id, req)
 	if err != nil {
 		l.c.logger.WithContext(ctx).Warn("trust-base catch-up page failed", "peer", id.String(), "from", req.FromEpoch, "error", err.Error())
