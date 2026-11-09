@@ -23,6 +23,9 @@ type UTBHistory interface {
 	Tip() (epoch uint64, id [types.TrustBaseV2IDLen]byte)
 	Ingest(ctx context.Context, updates [][]byte) (added int, gap bool, err error)
 	CatchUp(ctx context.Context, f gettrustbase.Fetcher, peers []peer.ID, to *uint64) (int, error)
+	// NoteSeen records an epoch a certificate claimed that is not held (a readiness hint only); NoteFeed records the outcome of a catch-up against the roots.
+	NoteSeen(epoch uint64)
+	NoteFeed(err error)
 }
 
 // utbHistoryProvider is implemented by the trust-base provider of a deployment with the signed trust-base history.
@@ -91,6 +94,7 @@ func (i utbIntake) AdmitNext(ctx context.Context) (uint64, error) {
 	c.logger.WithContext(ctx).Info("trust-base catch-up started", "from", next, "peers", len(peers))
 	added, err := c.utb.CatchUp(ctx, &loggingFetcher{f: fetcher, c: c}, peers, &next)
 	tip := c.utbTip()
+	c.utb.NoteFeed(err)
 	if err != nil {
 		c.logger.WithContext(ctx).Warn("trust-base catch-up finished", "added", added, "tip", tip, "error", err.Error())
 	} else {
@@ -263,5 +267,12 @@ func (c *BFTClientImpl) runUTBPoll(ctx context.Context, interval time.Duration) 
 		case <-t.C:
 			c.catchup.Signal()
 		}
+	}
+}
+
+// noteSeen tells the history that a certificate claimed this epoch (readiness only; the certificate stays unverified).
+func (c *BFTClientImpl) noteSeen(epoch uint64) {
+	if c.utb != nil {
+		c.utb.NoteSeen(epoch)
 	}
 }

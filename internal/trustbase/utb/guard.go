@@ -115,6 +115,20 @@ func (g *Guard) History() *History { return g.history }
 // prefix may be served), one wrapping ErrAuthority for a conflict (it must not be served), and any other error for a transient failure to read V1
 // (not remembered).
 func (g *Guard) Check(ctx context.Context) error {
+	if err := g.checkV1(ctx); err != nil {
+		return err
+	}
+	// The live signal: a certificate claimed an epoch above the held tip (the feeder has not covered it yet). Never an authority, only a reason to say so.
+	if seen, tip := g.history.Seen(), g.tip(); seen > tip {
+		return fmt.Errorf("%w: certificates of epoch %d were seen, held epochs %d..%d", ErrBehind, seen, g.history.genesis, tip)
+	}
+	return nil
+}
+
+func (g *Guard) tip() uint64 { t, _ := g.history.Tip(); return t }
+
+// checkV1 compares the history with the aggregator's own V1 trust base (a conflict, or an epoch the history does not cover).
+func (g *Guard) checkV1(ctx context.Context) error {
 	v1, err := g.latest(ctx)
 	if errors.Is(err, interfaces.ErrTrustBaseNotFound) {
 		return nil

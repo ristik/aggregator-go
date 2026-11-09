@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/unicitynetwork/aggregator-go/internal/storage/interfaces"
 	"sync"
 	"testing"
 	"time"
@@ -341,4 +342,47 @@ func TestCatchUpCountsOnlyTheEntriesItAppended(t *testing.T) {
 	require.Equal(t, 1, p.added, "the concurrent Ingest appended epoch 2")
 	require.EqualValues(t, 4, tipOf(h))
 	require.Equal(t, 2, added, "the catch-up appended epochs 3 and 4 only; the tip difference (3) would count epoch 2 twice across the two paths")
+}
+
+// The live signal: a certificate of an epoch the history does not hold makes the guard report the history behind (with an empty V1 store too, as in a
+// deployment without a V1 manager), and an append that covers the epoch clears it. A hint never admits anything.
+func TestAnEpochSeenInCertificatesMakesTheGuardBehindUntilTheFeederCoversIt(t *testing.T) {
+	c := utbtest.NewChain(t, 4, 5, 0)
+	h := open(t, c, 2, utbtest.NewMemStore())
+	g := utb.NewGuard(h, func(context.Context) (*types.RootTrustBaseV1, error) { return nil, interfaces.ErrTrustBaseNotFound })
+	require.NoError(t, g.Check(ctx))
+
+	h.NoteSeen(4)
+	h.NoteSeen(3) // a lower hint never lowers it
+	require.EqualValues(t, 4, h.Seen())
+	err := g.Check(ctx)
+	require.ErrorIs(t, err, utb.ErrBehind)
+	require.NotErrorIs(t, err, utb.ErrAuthority)
+	require.EqualValues(t, 2, tipOf(h), "a hint admits nothing")
+
+	_, _, err = h.Ingest(ctx, [][]byte{c.Raw[2]})
+	require.NoError(t, err)
+	require.ErrorIs(t, g.Check(ctx), utb.ErrBehind, "epoch 3 is held, 4 is still seen and not held")
+	_, _, err = h.Ingest(ctx, [][]byte{c.Raw[3]})
+	require.NoError(t, err)
+	require.NoError(t, g.Check(ctx), "the feeder covered the epoch")
+}
+
+func TestTheFeedStatusIsTheLastCatchUpAndNotAClaimOfFreshness(t *testing.T) {
+	c := utbtest.NewChain(t, 4, 3, 0)
+	h := open(t, c, 1, utbtest.NewMemStore())
+	e, at, ok := h.FeedStatus()
+	require.NoError(t, e)
+	require.True(t, at.IsZero() && ok.IsZero(), "nothing before the first catch-up")
+
+	h.NoteFeed(errors.New("no root answered"))
+	e, at, ok = h.FeedStatus()
+	require.Error(t, e)
+	require.False(t, at.IsZero())
+	require.True(t, ok.IsZero(), "a failure is not an answer")
+
+	h.NoteFeed(nil)
+	e, _, ok = h.FeedStatus()
+	require.NoError(t, e)
+	require.False(t, ok.IsZero())
 }

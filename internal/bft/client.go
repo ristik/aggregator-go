@@ -581,6 +581,7 @@ func (c *BFTClientImpl) handleCertificationResponse(ctx context.Context, cr *cer
 		// beyond the admitted history: no store read, no REST; only wake the worker (coalesced).
 		// "Not admitted yet" is not "invalid": nothing is accepted, nothing is cached as invalid.
 		c.catchup.Signal()
+		c.noteSeen(epoch)
 		return fmt.Errorf("%w: epoch %d", ErrEpochNotAdmitted, epoch)
 	}
 
@@ -591,6 +592,7 @@ func (c *BFTClientImpl) handleCertificationResponse(ctx context.Context, cr *cer
 	if err := op.verifyUC(&cr.UC, c.partitionID, c.shardID); err != nil {
 		if errors.Is(err, ErrEpochNotAdmitted) {
 			c.catchup.Signal()
+			c.noteSeen(cr.UC.GetRootEpoch())
 		}
 		return fmt.Errorf("failed to verify UC: %w", err)
 	}

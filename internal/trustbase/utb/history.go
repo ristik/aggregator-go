@@ -18,6 +18,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/unicitynetwork/bft-go-base/types"
@@ -84,6 +85,11 @@ type History struct {
 
 	refreshErr error
 	refreshAt  time.Time
+
+	seen    atomic.Uint64 // the highest epoch a certificate claimed that the history did not hold (a hint for readiness, never an authority)
+	feedErr error
+	feedAt  time.Time // the last catch-up in which a root answered (nil feedErr), or the last failure
+	feedOK  time.Time // the last catch-up in which a root answered coherently
 }
 
 // view is an immutable snapshot of the history: the slices are append-only, so a copy of their headers stays valid while the history grows.
@@ -363,6 +369,34 @@ func (h *History) Refresh(ctx context.Context) (adopted int, err error) {
 		return adopted, fmt.Errorf("%w: the store acknowledged epoch %d, this process can read up to %d (missing tail)", ErrStore, meta.TipEpoch, held)
 	}
 	return adopted, nil
+}
+
+// NoteSeen records an epoch that a certificate claimed and the history does not hold. It is only a hint (the certificate could not be verified): it
+// makes the guard report the history as behind until an append covers the epoch, and it never admits or authenticates anything.
+func (h *History) NoteSeen(epoch uint64) {
+	for cur := h.seen.Load(); epoch > cur && !h.seen.CompareAndSwap(cur, epoch); cur = h.seen.Load() {
+	}
+}
+
+// Seen is the highest epoch noted by NoteSeen (zero when none).
+func (h *History) Seen() uint64 { return h.seen.Load() }
+
+// NoteFeed records the outcome of a catch-up against the roots: nil when at least one root answered coherently (also when it had nothing newer), the
+// error otherwise.
+func (h *History) NoteFeed(err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.feedErr, h.feedAt = err, time.Now()
+	if err == nil {
+		h.feedOK = h.feedAt
+	}
+}
+
+// FeedStatus is the last catch-up outcome and the time of the last coherent answer (zero before the first). It makes no claim about wall-clock freshness.
+func (h *History) FeedStatus() (lastErr error, at time.Time, lastOK time.Time) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.feedErr, h.feedAt, h.feedOK
 }
 
 // Status is the outcome of the last Refresh (nil error and zero time before the first).
