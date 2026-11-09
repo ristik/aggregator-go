@@ -37,11 +37,6 @@ func (h *History) Committee(epoch uint64) (*types.RootTrustBaseV2, error) {
 	return nil, fmt.Errorf("%w %d", ErrUnknownEpoch, epoch)
 }
 
-// peerFault reports whether an Append error is the fault of the entry's supplier.
-func peerFault(err error) bool {
-	return errors.Is(err, ErrConflict) || errors.Is(err, ErrGap) || errors.Is(err, ErrChain)
-}
-
 func localFault(err error) error {
 	if errors.Is(err, ErrPersist) || errors.Is(err, ErrStore) {
 		return fmt.Errorf("%w: %w", ErrLocal, err)

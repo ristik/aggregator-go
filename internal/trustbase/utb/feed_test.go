@@ -1,10 +1,12 @@
 package utb_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/stretchr/testify/require"
@@ -244,4 +246,67 @@ func TestCatchUpIsCancellable(t *testing.T) {
 	_, err := h.CatchUp(cctx, p, []peer.ID{"root"}, nil)
 	require.ErrorIs(t, err, context.Canceled)
 	require.EqualValues(t, 1, tipOf(h))
+}
+
+// A verified entry that conflicts with a different successor in the shared store is this deployment's inconsistency, not the fault of the peers that serve
+// it: the sync ends as a local failure and asks no second peer, and Ingest reports it the same way.
+func TestAVerifiedEntryConflictingWithTheSharedStoreIsLocalNotAPeerFault(t *testing.T) {
+	c := utbtest.NewChain(t, 4, 5, 0)
+	store := utbtest.NewMemStore()
+	a, b := open(t, c, 3, store), open(t, c, 3, store)
+	_, err := a.Append(ctx, epoch4(t, bytes.Repeat([]byte{0x55}, 32), []int{0, 1, 2}))
+	require.NoError(t, err)
+
+	p := newPeers(t, 2, map[peer.ID]chainSource{"p1": {c, 5}, "p2": {c, 5}})
+	added, err := b.CatchUp(ctx, p, []peer.ID{"p1", "p2"}, nil)
+	require.ErrorIs(t, err, utb.ErrLocal)
+	require.NotErrorIs(t, err, utb.ErrConflict)
+	require.Zero(t, added)
+	require.Len(t, p.calls, 1, "the honest peers are not blamed: no second peer is asked")
+	require.EqualValues(t, 3, tipOf(b))
+
+	_, _, err = b.Ingest(ctx, [][]byte{c.Raw[3]})
+	require.ErrorIs(t, err, utb.ErrLocal)
+	require.NotErrorIs(t, err, utb.ErrConflict)
+}
+
+// slowPeers counts the pages in flight at once and holds each briefly, so two overlapping catch-ups would show.
+type slowPeers struct {
+	*peers
+	mu       sync.Mutex
+	inFlight int
+	max      int
+}
+
+func (p *slowPeers) Page(ctx context.Context, id peer.ID, req *gettrustbase.Request) (*gettrustbase.Response, [][]byte, error) {
+	p.mu.Lock()
+	p.inFlight++
+	if p.inFlight > p.max {
+		p.max = p.inFlight
+	}
+	p.mu.Unlock()
+	time.Sleep(20 * time.Millisecond)
+	defer func() { p.mu.Lock(); p.inFlight--; p.mu.Unlock() }()
+	return p.peers.Page(ctx, id, req)
+}
+
+func TestOnlyOneCatchUpRunsAtATime(t *testing.T) {
+	c := utbtest.NewChain(t, 4, 5, 0)
+	h := open(t, c, 1, utbtest.NewMemStore())
+	p := &slowPeers{peers: newPeers(t, 1, map[peer.ID]chainSource{"root": {c, 5}})}
+	var wg sync.WaitGroup
+	total := make([]int, 2)
+	for i := range total {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			n, err := h.CatchUp(ctx, p, []peer.ID{"root"}, nil)
+			require.NoError(t, err)
+			total[i] = n
+		}()
+	}
+	wg.Wait()
+	require.Equal(t, 1, p.max, "two catch-ups never fetch at the same time")
+	require.Equal(t, 4, total[0]+total[1], "each entry is counted once, by the catch-up that appended it")
+	require.EqualValues(t, 5, tipOf(h))
 }

@@ -722,10 +722,12 @@ func TestAnotherProcessStoredADifferentEntryOrADifferentWitnessForTheEpoch(t *te
 	_, err := a.Append(ctx, c.Raw[3])
 	require.NoError(t, err)
 
-	// b is offered a valid but different entry for epoch 4: it extends b's tip, but the store holds another one. A conflict; nothing changes.
+	// b is offered a valid but different entry for epoch 4: it extends b's tip, but the store holds another one. Not the supplier's fault (the entry
+	// verified from b's tip): a store inconsistency, never ErrConflict; nothing changes.
 	other := epoch4(t, bytes.Repeat([]byte{0x55}, 32), []int{0, 1, 2})
 	_, err = b.Append(ctx, other)
-	require.ErrorIs(t, err, utb.ErrConflict)
+	require.ErrorIs(t, err, utb.ErrStore)
+	require.NotErrorIs(t, err, utb.ErrConflict)
 	require.Equal(t, uint64(3), tipOf(b))
 	stored, err := store.Get(ctx, 4)
 	require.NoError(t, err)
