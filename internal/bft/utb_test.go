@@ -222,6 +222,67 @@ func TestUTBModeNeverConsultsVersion1TrustBases(t *testing.T) {
 
 var _ = errors.New
 
+// v1Counter is a provider that counts every version 1 lookup and still serves the history, so a test can show the client never asks for V1.
+type v1Counter struct {
+	interfaces.TrustBaseProvider
+	calls int
+}
+
+func (p *v1Counter) GetByEpoch(ctx context.Context, epoch uint64) (*types.RootTrustBaseV1, error) {
+	p.calls++
+	return p.TrustBaseProvider.GetByEpoch(ctx, epoch)
+}
+
+func (p *v1Counter) UTBHistory() UTBHistory {
+	return p.TrustBaseProvider.(utbHistoryProvider).UTBHistory()
+}
+
+// The client never asks for a version 1 trust base while the history is the authority: not for an attachment, an accepted or refused certificate, an
+// unknown epoch, the worker's catch-up or the handshake.
+func TestTheClientNeverAsksForVersion1WhileTheHistoryIsTheAuthority(t *testing.T) {
+	c, h, srv, j, e2raw, _ := threeEpochs(t, fixturePartition)
+	counter := &v1Counter{TrustBaseProvider: NewUTBProvider(h)}
+	c.trustBaseStore = counter
+	c.trustBaseFetcher = &fixtureFetcher{Srv: srv}
+	c.roundManager = &stubRoundManager{}
+	ctx := context.Background()
+
+	_ = c.handleCombinedResponse(ctx, signedResponse(t, 2, j[:3]), [][]byte{e2raw}) // attachment, then a certificate of the new epoch
+	_ = c.handleCertificationResponse(ctx, signedResponse(t, 3, j[:3]))             // unknown epoch
+	c.catchup.runOnce(ctx)
+	_, _ = c.handshakeAuthority(ctx, 3)
+	require.Equal(t, uint64(3), tipOf(h), "the flows above really ran (attachment and worker)")
+	require.Zero(t, counter.calls)
+}
+
+// A response folds two consecutive entries (a handoff the client missed in between): both are appended in order in one message and the admitted head
+// follows the second.
+func TestAFoldedResponseAdmitsBothConsecutiveEntries(t *testing.T) {
+	c, h, _, _, e2raw, e3raw := threeEpochs(t, fixturePartition)
+	c.roundManager = &stubRoundManager{}
+	err := c.handleCombinedResponse(context.Background(), signedResponse(t, 3, fixtureMembers(t, 4)[:3]), [][]byte{e2raw, e3raw})
+	require.Error(t, err, "the certificate is of a committee that is not epoch 3's")
+	require.Equal(t, uint64(3), tipOf(h))
+	require.Equal(t, uint64(3), c.admittedHead.Load())
+}
+
+// A certificate of an epoch the history does not hold marks the history behind (a hint, nothing admitted), the worker catches it up from the roots, and
+// the catch-up outcome is recorded.
+func TestAnUnknownEpochCertificateMarksTheHistoryBehindUntilTheWorkerCatchesUp(t *testing.T) {
+	c, h, srv, j, _, _ := threeEpochs(t, fixturePartition)
+	c.trustBaseFetcher = &fixtureFetcher{Srv: srv}
+	err := c.handleCertificationResponse(context.Background(), signedResponse(t, 3, j[:3]))
+	require.ErrorIs(t, err, ErrEpochNotAdmitted)
+	require.EqualValues(t, 2, h.Seen(), "the claim of epoch 3 is capped at the held tip + 1")
+	require.Equal(t, uint64(1), tipOf(h), "nothing was admitted by a certificate")
+
+	c.catchup.runOnce(context.Background())
+	require.Equal(t, uint64(3), tipOf(h))
+	feedErr, at, ok := h.FeedStatus()
+	require.NoError(t, feedErr)
+	require.False(t, at.IsZero() || ok.IsZero())
+}
+
 // Certificates are judged by the shared authenticator under the held entry of the seal's own epoch: its strict weighted quorum, the network, the
 // epoch's start and, once the successor is held, its retirement.
 func TestAuthenticatorUnderTheHeldHistory(t *testing.T) {
@@ -419,4 +480,25 @@ func TestPollDelayIsJitteredWithinTwentyPercent(t *testing.T) {
 	require.Equal(t, 24*time.Second, pollDelay(DefaultUTBPollInterval, 0))
 	require.Equal(t, 30*time.Second, pollDelay(DefaultUTBPollInterval, 0.5))
 	require.InDelta(t, float64(36*time.Second), float64(pollDelay(DefaultUTBPollInterval, 0.999999)), float64(time.Millisecond))
+}
+
+// A forged certificate of a huge epoch marks the history behind only until the next catch-up in which the roots have nothing newer; it never sticks.
+func TestAForgedCertificateEpochDoesNotLeaveTheHistoryBehindForGood(t *testing.T) {
+	c, h, srv, j, _, _ := threeEpochs(t, fixturePartition)
+	c.trustBaseFetcher = &fixtureFetcher{Srv: srv}
+	g := utb.NewGuard(h, func(context.Context) (*types.RootTrustBaseV1, error) { return nil, interfaces.ErrTrustBaseNotFound })
+	ctx := context.Background()
+	c.catchup.runOnce(ctx) // the roots hold three epochs
+	require.Equal(t, uint64(3), tipOf(h))
+	require.NoError(t, g.Check(ctx))
+
+	err := c.handleCertificationResponse(ctx, signedResponse(t, 1<<62, j[:3]))
+	require.ErrorIs(t, err, ErrEpochNotAdmitted)
+	require.ErrorIs(t, g.Check(ctx), utb.ErrBehind, "the claim is visible while it stands")
+
+	later := time.Now().Add(time.Hour) // past the miss cooldown the first current-frontier attempt left
+	c.catchup.now = func() time.Time { return later }
+	c.catchup.runOnce(ctx)
+	require.NoError(t, g.Check(ctx), "the roots have nothing newer: the unverified claim is dropped")
+	require.Equal(t, uint64(3), tipOf(h))
 }
