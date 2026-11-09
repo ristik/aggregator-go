@@ -179,12 +179,12 @@ var ErrNextEpochUnavailable = errors.New("the next trust base epoch is not avail
 // GetByEpochLocal returns the trust base of the epoch from the local store only (interfaces.
 // ErrTrustBaseNotFound if it is not admitted): it never queries the BFT node, so it is safe to call
 // for every received message.
-func (s *TrustBaseManager) GetByEpochLocal(ctx context.Context, epoch uint64) (*types.RootTrustBaseV1, error) {
+func (s *TrustBaseManager) GetByEpochLocal(ctx context.Context, epoch uint64) (types.RootTrustBase, error) {
 	tb, known, err := s.GetAdmitted(ctx, epoch)
 	if err != nil {
 		return nil, err
 	}
-	if !known {
+	if !known || tb == nil {
 		return nil, interfaces.ErrTrustBaseNotFound
 	}
 	return tb, nil
