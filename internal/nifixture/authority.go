@@ -3,7 +3,7 @@ package nifixture
 import (
 	"errors"
 
-	"github.com/unicitynetwork/bft-core/rootchain/testutils/ucfixture"
+	"github.com/unicitynetwork/aggregator-go/internal/ucfixture"
 	"github.com/unicitynetwork/bft-go-base/types"
 )
 

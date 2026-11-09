@@ -8,6 +8,7 @@ import (
 
 	"github.com/unicitynetwork/bft-go-base/types"
 
+	"github.com/unicitynetwork/aggregator-go/internal/consolidationcorpus"
 	"github.com/unicitynetwork/aggregator-go/pkg/api"
 	"github.com/unicitynetwork/aggregator-go/pkg/noninclusion"
 )
@@ -29,8 +30,9 @@ func ExampleVerifier_Verify() {
 	}
 	readExampleJSON("cases/shared-prefix.json", &vec)
 	tbBytes, _ := os.ReadFile(filepath.Join(corpus, "authority/trust-base.cbor"))
-	tb := &types.RootTrustBaseV1{}
-	if err := tb.UnmarshalCBOR(tbBytes); err != nil {
+	// the authority is a trust base v2 bundle holding the genesis entry of the network
+	tb, err := consolidationcorpus.DecodeAuthority(tbBytes)
+	if err != nil {
 		panic(err)
 	}
 	v, err := noninclusion.NewVerifier(noninclusion.Context{
@@ -64,7 +66,7 @@ func ExampleVerifier_Verify() {
 	snap := res.Snapshot()
 	// the checkpoint is the application's own configuration (here the fixture network and a required round), never
 	// derived from the proof, the response or this snapshot
-	checkpoint := appCheckpoint{NetworkID: types.NetworkTestNet, RequiredRootRound: 3}
+	checkpoint := appCheckpoint{NetworkID: types.NetworkLocal, RequiredRootRound: 3}
 	if snap.NetworkID() != checkpoint.NetworkID || snap.RootRound() < checkpoint.RequiredRootRound {
 		fmt.Println("snapshot does not meet the application policy")
 		return
@@ -79,8 +81,9 @@ func ExampleVerifier_Verify() {
 // Non-inclusion proves absence only at the authenticated snapshot returned by verification. It does not prove absence now, continuous absence, or that a token can be spent. Compare the snapshot’s network and root round (or its certified seal timestamp under your application’s time policy) with an independently trusted requirement. The seal timestamp is a consensus-certified time, not proof of real-time freshness. Do not use unverified response metadata for this check.
 func ExampleVerifier_Verify_outcome() {
 	tbBytes, _ := os.ReadFile(filepath.Join(corpus, "authority/trust-base.cbor"))
-	tb := &types.RootTrustBaseV1{}
-	if err := tb.UnmarshalCBOR(tbBytes); err != nil {
+	// the authority is a trust base v2 bundle holding the genesis entry of the network
+	tb, err := consolidationcorpus.DecodeAuthority(tbBytes)
+	if err != nil {
 		panic(err)
 	}
 	v, err := noninclusion.NewVerifier(noninclusion.Context{
@@ -136,8 +139,9 @@ func ExampleVerifier_Verify_otherNetwork() {
 	}
 	readExampleJSON("cases/shared-prefix.json", &vec)
 	tbBytes, _ := os.ReadFile(filepath.Join(corpus, "authority/trust-base.cbor"))
-	tb := &types.RootTrustBaseV1{}
-	if err := tb.UnmarshalCBOR(tbBytes); err != nil {
+	// the authority is a trust base v2 bundle holding the genesis entry of the network
+	tb, err := consolidationcorpus.DecodeAuthority(tbBytes)
+	if err != nil {
 		panic(err)
 	}
 	v, err := noninclusion.NewVerifier(noninclusion.Context{
@@ -163,8 +167,8 @@ func ExampleVerifier_Verify_otherNetwork() {
 	snap := res.Snapshot()
 	for _, required := range []appCheckpoint{
 		{NetworkID: types.NetworkMainNet, RequiredRootRound: 1}, // the application is a mainnet one
-		{NetworkID: types.NetworkTestNet, RequiredRootRound: snap.RootRound() + 1},
-		{NetworkID: types.NetworkTestNet, RequiredRootRound: snap.RootRound()},
+		{NetworkID: types.NetworkLocal, RequiredRootRound: snap.RootRound() + 1},
+		{NetworkID: types.NetworkLocal, RequiredRootRound: snap.RootRound()},
 	} {
 		if snap.NetworkID() != required.NetworkID || snap.RootRound() < required.RequiredRootRound {
 			fmt.Printf("rejected for network %d, round >= %d (snapshot: network %d, round %d)\n", required.NetworkID, required.RequiredRootRound, snap.NetworkID(), snap.RootRound())
@@ -173,7 +177,7 @@ func ExampleVerifier_Verify_otherNetwork() {
 		fmt.Printf("accepted for network %d, round >= %d\n", required.NetworkID, required.RequiredRootRound)
 	}
 	// Output:
-	// rejected for network 1, round >= 1 (snapshot: network 2, round 6)
-	// rejected for network 2, round >= 7 (snapshot: network 2, round 6)
-	// accepted for network 2, round >= 6
+	// rejected for network 1, round >= 1 (snapshot: network 3, round 6)
+	// rejected for network 3, round >= 7 (snapshot: network 3, round 6)
+	// accepted for network 3, round >= 6
 }
