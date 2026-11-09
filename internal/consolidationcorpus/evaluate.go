@@ -253,7 +253,7 @@ func EvaluateWith(files Files, opts Options) (*Result, error) {
 // Loaded is a decoded case: everything a consumer needs to run the pipeline.
 type Loaded struct {
 	Context   Context
-	TrustBase *types.RootTrustBaseV1
+	TrustBase *types.RootTrustBaseV2
 	Policy    consolidation.Policy
 	Input     *consolidation.Input
 	Evidence  []consolidation.Evidence
@@ -269,11 +269,10 @@ func Load(files Files) (*Loaded, error) {
 			return nil, err
 		}
 	}
-	l.TrustBase = &types.RootTrustBaseV1{}
-	if err := l.TrustBase.UnmarshalCBOR(files[l.Context.TrustBase]); err != nil {
+	var err error
+	if l.TrustBase, err = DecodeAuthority(files[l.Context.TrustBase]); err != nil {
 		return nil, fmt.Errorf("trust base: %w", err)
 	}
-	var err error
 	if l.Policy, err = policyOf(&l.Context); err != nil {
 		return nil, err
 	}

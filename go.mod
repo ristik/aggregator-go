@@ -273,7 +273,7 @@ require (
 )
 
 // Pins: ristik/bft-core integration/enshrined-evm at the merge of the upstream sync (#650), advanced to the 256-member / 128 KiB entry profile (bft-core#944, #951), with the bounded V2/V3 certification receive caps (bft-core#953; f94b4b41), with the combined 0.0.3 response and the
-// signed trust-base history, and the bft-go-base it pins (bft-go-base#3, 8890ddce).
+// signed trust-base history. bft-go-base: ristik/bft-go-base 81ee667 (the shared trust-base bundle and response codecs, bft-go-base#20's content), which the staging line and the UTB v2 packages both build against.
 replace github.com/unicitynetwork/bft-core => github.com/ristik/bft-core v1.1.1-0.20261107234634-f94b4b410059
 
-replace github.com/unicitynetwork/bft-go-base => github.com/ristik/bft-go-base v1.1.1-0.20261019192807-8890ddce75de
+replace github.com/unicitynetwork/bft-go-base => github.com/ristik/bft-go-base v1.1.1-0.20261107183428-81ee667315cb

@@ -413,12 +413,12 @@ func negatives(b *builtCase) []negative {
 		}})
 	add(negative{name: "trust-base-other-network", desc: "same keys under another network", stage: stEv, outcome: unauth,
 		mutate: func(_ *builtCase, f consolidationcorpus.Files) error {
-			tb := &types.RootTrustBaseV1{}
-			if err := tb.UnmarshalCBOR(f[consolidationcorpus.FileTrustBase]); err != nil {
+			tb, err := consolidationcorpus.DecodeAuthority(f[consolidationcorpus.FileTrustBase])
+			if err != nil {
 				return err
 			}
 			tb.NetworkID++
-			bs, err := tb.MarshalCBOR()
+			bs, err := consolidationcorpus.EntryBundle(tb)
 			f[consolidationcorpus.FileTrustBase] = bs
 			if err != nil {
 				return err
@@ -428,12 +428,12 @@ func negatives(b *builtCase) []negative {
 		}})
 	add(negative{name: "trust-base-other-epoch", desc: "same keys in another epoch", stage: stEv, outcome: unauth,
 		mutate: func(_ *builtCase, f consolidationcorpus.Files) error {
-			tb := &types.RootTrustBaseV1{}
-			if err := tb.UnmarshalCBOR(f[consolidationcorpus.FileTrustBase]); err != nil {
+			tb, err := consolidationcorpus.DecodeAuthority(f[consolidationcorpus.FileTrustBase])
+			if err != nil {
 				return err
 			}
 			tb.Epoch++
-			bs, err := tb.MarshalCBOR()
+			bs, err := consolidationcorpus.EntryBundle(tb)
 			f[consolidationcorpus.FileTrustBase] = bs
 			return err
 		}})
@@ -744,7 +744,7 @@ func replaceTrustBaseKeys(f consolidationcorpus.Files) error {
 	if err != nil {
 		return err
 	}
-	bs, err := tb.MarshalCBOR()
+	bs, err := consolidationcorpus.AuthorityBundle(tb)
 	f[consolidationcorpus.FileTrustBase] = bs
 	return err
 }

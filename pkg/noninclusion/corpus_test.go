@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/unicitynetwork/bft-go-base/types"
 
+	"github.com/unicitynetwork/aggregator-go/internal/consolidationcorpus"
 	"github.com/unicitynetwork/aggregator-go/internal/nifixture"
 	"github.com/unicitynetwork/aggregator-go/pkg/api"
 	"github.com/unicitynetwork/aggregator-go/pkg/noninclusion"
@@ -50,10 +51,10 @@ type vector struct {
 }
 
 type corpusContext struct {
-	TrustBase      string `json:"trustBase"`
-	Shard          string `json:"shard"`
-	NextEpochStart string `json:"nextEpochStart"`
-	ShardConfHash  string `json:"shardConfHash"`
+	TrustBaseBundle string `json:"trustBaseBundle"`
+	Shard           string `json:"shard"`
+	NextEpochStart  string `json:"nextEpochStart"`
+	ShardConfHash   string `json:"shardConfHash"`
 }
 
 func readJSON(t testing.TB, path string, v any) {
@@ -76,10 +77,10 @@ func shardOf(t testing.TB, bits string) types.ShardID {
 }
 
 func verifierFor(t testing.TB, cc corpusContext) *noninclusion.Verifier {
-	tbBytes, err := os.ReadFile(filepath.Join(corpus, cc.TrustBase))
+	tbBytes, err := os.ReadFile(filepath.Join(corpus, cc.TrustBaseBundle))
 	require.NoError(t, err)
-	tb := &types.RootTrustBaseV1{}
-	require.NoError(t, tb.UnmarshalCBOR(tbBytes))
+	tb, err := consolidationcorpus.DecodeAuthority(tbBytes)
+	require.NoError(t, err)
 	ctx := noninclusion.Context{
 		Shard:    shardOf(t, cc.Shard),
 		Resolver: func(*types.UnicitySeal) (types.RootTrustBase, error) { return tb, nil },

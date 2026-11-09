@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/unicitynetwork/bft-core/rootchain/testutils/ucfixture"
+	"github.com/unicitynetwork/aggregator-go/internal/ucfixture"
 	"github.com/unicitynetwork/bft-go-base/types"
 
 	"github.com/unicitynetwork/aggregator-go/internal/consolidationcorpus"
@@ -408,7 +408,7 @@ func buildCase(spec caseSpec) (*builtCase, error) {
 	if err := files.Encode(consolidationcorpus.FileContext, ctxFile); err != nil {
 		return nil, err
 	}
-	if files[consolidationcorpus.FileTrustBase], err = prod.TrustBaseCBOR(); err != nil {
+	if files[consolidationcorpus.FileTrustBase], err = consolidationcorpus.AuthorityBundle(prod.TrustBase()); err != nil {
 		return nil, err
 	}
 	pspec := producerSpec{Partition: uint32(partition), ShardBits: spec.bits}
