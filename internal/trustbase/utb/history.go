@@ -372,11 +372,19 @@ func (h *History) Refresh(ctx context.Context) (adopted int, err error) {
 }
 
 // NoteSeen records an epoch that a certificate claimed and the history does not hold. It is only a hint (the certificate could not be verified): it
-// makes the guard report the history as behind until an append covers the epoch, and it never admits or authenticates anything.
+// makes the guard report the history as behind until an append covers the epoch or a catch-up finds the roots have nothing newer (ClearSeen), and it
+// never admits or authenticates anything. A claim is capped at one above the held tip, so a forged huge epoch is no more than "something is missing".
 func (h *History) NoteSeen(epoch uint64) {
+	tip, _ := h.Tip()
+	if epoch > tip+1 {
+		epoch = tip + 1
+	}
 	for cur := h.seen.Load(); epoch > cur && !h.seen.CompareAndSwap(cur, epoch); cur = h.seen.Load() {
 	}
 }
+
+// ClearSeen drops the hint: the roots answered coherently and have nothing newer than the held tip, so the claim was not backed by the committee we know.
+func (h *History) ClearSeen() { h.seen.Store(0) }
 
 // Seen is the highest epoch noted by NoteSeen (zero when none).
 func (h *History) Seen() uint64 { return h.seen.Load() }

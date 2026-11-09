@@ -273,7 +273,7 @@ func TestAnUnknownEpochCertificateMarksTheHistoryBehindUntilTheWorkerCatchesUp(t
 	c.trustBaseFetcher = &fixtureFetcher{Srv: srv}
 	err := c.handleCertificationResponse(context.Background(), signedResponse(t, 3, j[:3]))
 	require.ErrorIs(t, err, ErrEpochNotAdmitted)
-	require.EqualValues(t, 3, h.Seen())
+	require.EqualValues(t, 2, h.Seen(), "the claim of epoch 3 is capped at the held tip + 1")
 	require.Equal(t, uint64(1), tipOf(h), "nothing was admitted by a certificate")
 
 	c.catchup.runOnce(context.Background())
@@ -480,4 +480,25 @@ func TestPollDelayIsJitteredWithinTwentyPercent(t *testing.T) {
 	require.Equal(t, 24*time.Second, pollDelay(DefaultUTBPollInterval, 0))
 	require.Equal(t, 30*time.Second, pollDelay(DefaultUTBPollInterval, 0.5))
 	require.InDelta(t, float64(36*time.Second), float64(pollDelay(DefaultUTBPollInterval, 0.999999)), float64(time.Millisecond))
+}
+
+// A forged certificate of a huge epoch marks the history behind only until the next catch-up in which the roots have nothing newer; it never sticks.
+func TestAForgedCertificateEpochDoesNotLeaveTheHistoryBehindForGood(t *testing.T) {
+	c, h, srv, j, _, _ := threeEpochs(t, fixturePartition)
+	c.trustBaseFetcher = &fixtureFetcher{Srv: srv}
+	g := utb.NewGuard(h, func(context.Context) (*types.RootTrustBaseV1, error) { return nil, interfaces.ErrTrustBaseNotFound })
+	ctx := context.Background()
+	c.catchup.runOnce(ctx) // the roots hold three epochs
+	require.Equal(t, uint64(3), tipOf(h))
+	require.NoError(t, g.Check(ctx))
+
+	err := c.handleCertificationResponse(ctx, signedResponse(t, 1<<62, j[:3]))
+	require.ErrorIs(t, err, ErrEpochNotAdmitted)
+	require.ErrorIs(t, g.Check(ctx), utb.ErrBehind, "the claim is visible while it stands")
+
+	later := time.Now().Add(time.Hour) // past the miss cooldown the first current-frontier attempt left
+	c.catchup.now = func() time.Time { return later }
+	c.catchup.runOnce(ctx)
+	require.NoError(t, g.Check(ctx), "the roots have nothing newer: the unverified claim is dropped")
+	require.Equal(t, uint64(3), tipOf(h))
 }

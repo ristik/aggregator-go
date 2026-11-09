@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"github.com/unicitynetwork/aggregator-go/internal/storage/interfaces"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -352,18 +353,15 @@ func TestAnEpochSeenInCertificatesMakesTheGuardBehindUntilTheFeederCoversIt(t *t
 	g := utb.NewGuard(h, func(context.Context) (*types.RootTrustBaseV1, error) { return nil, interfaces.ErrTrustBaseNotFound })
 	require.NoError(t, g.Check(ctx))
 
-	h.NoteSeen(4)
-	h.NoteSeen(3) // a lower hint never lowers it
-	require.EqualValues(t, 4, h.Seen())
+	h.NoteSeen(3)
+	h.NoteSeen(2) // a lower hint never lowers it
+	require.EqualValues(t, 3, h.Seen())
 	err := g.Check(ctx)
 	require.ErrorIs(t, err, utb.ErrBehind)
 	require.NotErrorIs(t, err, utb.ErrAuthority)
 	require.EqualValues(t, 2, tipOf(h), "a hint admits nothing")
 
 	_, _, err = h.Ingest(ctx, [][]byte{c.Raw[2]})
-	require.NoError(t, err)
-	require.ErrorIs(t, g.Check(ctx), utb.ErrBehind, "epoch 3 is held, 4 is still seen and not held")
-	_, _, err = h.Ingest(ctx, [][]byte{c.Raw[3]})
 	require.NoError(t, err)
 	require.NoError(t, g.Check(ctx), "the feeder covered the epoch")
 }
@@ -385,4 +383,24 @@ func TestTheFeedStatusIsTheLastCatchUpAndNotAClaimOfFreshness(t *testing.T) {
 	e, _, ok = h.FeedStatus()
 	require.NoError(t, e)
 	require.False(t, ok.IsZero())
+}
+
+// One forged certificate must not leave the history marked behind for good: the claim is capped at one above the held tip, and a catch-up in which the
+// roots answer with nothing newer clears it.
+func TestAForgedHugeEpochIsCappedAndClearedWhenTheRootsHaveNothingNewer(t *testing.T) {
+	c := utbtest.NewChain(t, 4, 3, 0)
+	h := open(t, c, 3, utbtest.NewMemStore())
+	g := utb.NewGuard(h, func(context.Context) (*types.RootTrustBaseV1, error) { return nil, interfaces.ErrTrustBaseNotFound })
+
+	h.NoteSeen(math.MaxUint64)
+	require.EqualValues(t, 4, h.Seen(), "capped at the held tip + 1")
+	require.ErrorIs(t, g.Check(ctx), utb.ErrBehind)
+
+	// roots with nothing newer: the catch-up finds no progress without an error
+	p := newPeers(t, 2, map[peer.ID]chainSource{"root": {c, 3}})
+	added, err := h.CatchUp(ctx, p, []peer.ID{"root"}, nil)
+	require.NoError(t, err)
+	require.Zero(t, added)
+	h.ClearSeen() // what the client does on exactly this outcome
+	require.NoError(t, g.Check(ctx))
 }

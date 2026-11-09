@@ -25,6 +25,7 @@ type UTBHistory interface {
 	CatchUp(ctx context.Context, f gettrustbase.Fetcher, peers []peer.ID, to *uint64) (int, error)
 	// NoteSeen records an epoch a certificate claimed that is not held (a readiness hint only); NoteFeed records the outcome of a catch-up against the roots.
 	NoteSeen(epoch uint64)
+	ClearSeen()
 	NoteFeed(err error)
 }
 
@@ -102,6 +103,8 @@ func (i utbIntake) AdmitNext(ctx context.Context) (uint64, error) {
 	}
 	if tip < next {
 		if err == nil {
+			// the roots answered coherently and have nothing newer: an unverified claim of a higher epoch was not backed by them
+			c.utb.ClearSeen()
 			err = errors.New("no root served it")
 		}
 		return 0, fmt.Errorf("%w: epoch %d: %w", ErrNextEpochNotFetched, next, err)
