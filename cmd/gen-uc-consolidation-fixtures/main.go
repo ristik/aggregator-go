@@ -29,7 +29,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/unicitynetwork/bft-core/rootchain/testutils/ucfixture"
+	"github.com/unicitynetwork/aggregator-go/internal/ucfixture"
 	abcrypto "github.com/unicitynetwork/bft-go-base/crypto"
 	"github.com/unicitynetwork/bft-go-base/types"
 
