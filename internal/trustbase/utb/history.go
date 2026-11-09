@@ -39,6 +39,9 @@ var (
 	ErrConflict = errors.New("a different trust-base entry is held for the epoch")
 	ErrGap      = errors.New("trust-base entry is ahead of the next epoch")
 	ErrChain    = errors.New("trust-base entry does not extend the held history")
+	// ErrPersist: the local durable store failed while writing a verified entry (nothing was published). It is this process's fault, never the fault of the
+	// peer that supplied the entry.
+	ErrPersist = errors.New("trust-base store write failed")
 )
 
 // Outcome of Append.
@@ -71,6 +74,8 @@ type History struct {
 	store   Store
 
 	wmu sync.Mutex // serialises Append and Refresh
+
+	syncMu sync.Mutex // one catch-up at a time (feed.go)
 
 	mu      sync.RWMutex // guards the slices (append-only) and the refresh status
 	raw     [][]byte
@@ -226,7 +231,8 @@ func (h *History) verifyNext(e *types.RootTrustBaseV2, _ [types.TrustBaseV2IDLen
 
 // Append adds the next entry: strict decode, exactly the epoch after the held tip, verified from the held tip (previous-quorum signatures, hash link,
 // network, start round), persisted, then served. Held entries are never replaced. The same entry again is a NoOp (its witness must still verify); a
-// different entry at a held epoch is ErrConflict, one ahead of the next epoch ErrGap, one that does not extend the tip ErrChain. If the store already
+// different entry at an epoch this process holds is ErrConflict (the supplier's fault), one ahead of the next epoch ErrGap, one that does not extend the tip
+// ErrChain. A verified entry that conflicts with one only the shared store holds is ErrStore (not the supplier's fault). If the store already
 // holds the epoch (another process wrote it) the stored bytes are validated and adopted: the entry is new to this process, so it is Appended without
 // being written again. A failed write publishes nothing; retrying is safe.
 //
@@ -291,17 +297,19 @@ func (h *History) Append(ctx context.Context, raw []byte) (Outcome, error) {
 			return 0, fmt.Errorf("%w: %v", ErrStore, derr)
 		}
 		if sid != id {
-			return 0, fmt.Errorf("%w: the store holds another entry for epoch %d", ErrConflict, e.Epoch)
+			// The candidate passed verifyNext, so no peer forged it: the shared store holds another independently written successor (root equivocation, or
+			// another writer), or the store is wrong. Neither is the supplier's fault: ErrStore (local), which ends a sync instead of blaming honest peers.
+			return 0, fmt.Errorf("%w: a verified entry for epoch %d conflicts with the one the store holds", ErrStore, e.Epoch)
 		}
 		if verr := h.verifyNext(se, sid); verr != nil {
 			return 0, fmt.Errorf("%w: the stored epoch %d: %v", ErrStore, e.Epoch, verr)
 		}
 		raw, e = stored, se
 	default:
-		return 0, fmt.Errorf("persisting epoch %d: %w", e.Epoch, err)
+		return 0, fmt.Errorf("%w: persisting epoch %d: %w", ErrPersist, e.Epoch, err)
 	}
 	if err := h.store.Advance(ctx, e.Epoch, id); err != nil {
-		return 0, fmt.Errorf("advancing the stored tip to epoch %d: %w", e.Epoch, err)
+		return 0, fmt.Errorf("%w: advancing the stored tip to epoch %d: %w", ErrPersist, e.Epoch, err)
 	}
 	h.publish(raw, e, id)
 	return Appended, nil
