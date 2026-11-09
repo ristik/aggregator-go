@@ -5,7 +5,7 @@
     "command": "UC_FIXTURE_AGGREGATOR_COMMIT=$(git rev-parse HEAD) go run ./cmd/gen-uc-consolidation-fixtures -out testdata/uc-consolidation/v1",
     "toolchain": "go1.27.3",
     "commits": {
-      "aggregator-go": "5dc939966d12e218a0279cd6138ec731300185b0",
+      "aggregator-go": "10522e01255e94057a87b4a39652231fa717b56f",
       "bft-core": "f94b4b410059",
       "bft-go-base": "81ee667315cb"
     },
