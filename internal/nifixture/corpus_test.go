@@ -79,7 +79,7 @@ func TestVectorsAgreeWithTheReferenceModel(t *testing.T) {
 		require.NoError(t, json.Unmarshal(b, &v), name)
 		c, ok := contexts[v.Context]
 		require.True(t, ok, name)
-		var tb types.RootTrustBase = decodeTB(t, files[c.TrustBase])
+		var tb types.RootTrustBase = decodeTB(t, files[c.TrustBaseBundle])
 		w, q := unhex(v.Wrapper), [32]byte(unhex(v.Query))
 		verdict, snap := Verdict(w, q, c, tb)
 		want := expectedOf(verdict, snap, v.Query, v.Expected.Acceptable)
@@ -121,10 +121,16 @@ func TestVectorsAgreeWithTheReferenceModel(t *testing.T) {
 	require.GreaterOrEqual(t, negatives, 55)
 }
 
+// decodeTB opens an authority bundle: exactly one genesis entry, pinned by its own EntryID (the way a verifier opens it).
 func decodeTB(t *testing.T, b []byte) types.RootTrustBase {
-	tb := &types.RootTrustBaseV1{}
-	require.NoError(t, tb.UnmarshalCBOR(b))
-	return tb
+	bundle, err := types.DecodeTrustBaseBundle(b, types.TrustBaseLimits{MaxBytes: len(b), MaxEntries: 1})
+	require.NoError(t, err)
+	require.Len(t, bundle.Entries, 1)
+	id, err := bundle.Entries[0].EntryID()
+	require.NoError(t, err)
+	require.NoError(t, types.VerifyTrustBaseBundle(bundle, id))
+	require.NoError(t, bundle.Entries[0].VerifyGenesis())
+	return bundle.Entries[0]
 }
 
 // Property check of the reference relation on random trees: a query is absent iff the tree lacks it, a
@@ -176,24 +182,19 @@ func TestReferenceRelationOnRandomTrees(t *testing.T) {
 	}
 }
 
-// The SDKs read the JSON form: it must be the same authority as the CBOR one, and acceptable verdicts are rejections.
-func TestJSONTrustBasesAndAcceptableVerdicts(t *testing.T) {
+// Every context's authority is a valid trust base v2 bundle, and acceptable verdicts are rejections. No file of the corpus is a JSON
+// trust base.
+func TestAuthorityBundlesAndAcceptableVerdicts(t *testing.T) {
 	files := readCorpus(t)
 	var contexts map[string]Context
 	require.NoError(t, json.Unmarshal(files["contexts.json"], &contexts))
 	for name, c := range contexts {
-		cb, ok := files[c.TrustBase]
+		cb, ok := files[c.TrustBaseBundle]
 		require.True(t, ok, name)
-		jb, ok := files[c.TrustBaseJSON]
-		require.True(t, ok, name)
-		a, b := &types.RootTrustBaseV1{}, &types.RootTrustBaseV1{}
-		require.NoError(t, a.UnmarshalCBOR(cb))
-		require.NoError(t, json.Unmarshal(jb, b), name)
-		ab, err := a.MarshalCBOR()
-		require.NoError(t, err)
-		bb, err := b.MarshalCBOR()
-		require.NoError(t, err)
-		require.Equal(t, ab, bb, name)
+		decodeTB(t, cb)
+	}
+	for name := range files {
+		require.False(t, strings.HasPrefix(name, "authority/") && strings.HasSuffix(name, ".json"), name+": the corpus carries no JSON trust base")
 	}
 	for name, b := range files {
 		if !strings.HasPrefix(name, "negative/") {

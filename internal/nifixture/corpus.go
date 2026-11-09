@@ -64,10 +64,10 @@ type Files map[string][]byte
 // the fixed Partition.
 type Context struct {
 	Description string `json:"description"`
-	// TrustBase is the corpus path of the CBOR encoded trust base (authority); TrustBaseJSON is the
-	// same authority in the JSON form the SDKs read (RootTrustBase.from_json / fromJSON).
-	TrustBase     string `json:"trustBase"`
-	TrustBaseJSON string `json:"trustBaseJson"`
+	// TrustBaseBundle is the corpus path of the authority: a complete Unicity Trust Base v2 bundle (tag 39015,
+	// the GET /api/v1/trustbases response from the genesis entry to the tip) holding the single genesis entry of
+	// the authority. A verifier opens it as a trust base history pinned to that genesis.
+	TrustBaseBundle string `json:"trustBaseBundle"`
 	// Shard is the expected shard of the partition as a bit string ("" is the unsharded partition, "01" the
 	// shard whose keys start with the bits 01).
 	Shard string `json:"shard"`
@@ -700,12 +700,31 @@ func Generate(aggregatorCommit string) (Files, error) {
 		return nil, err
 	}
 	tb := prod.TrustBase()
-	tbBytes, err := prod.TrustBaseCBOR()
+	// The authority is published as a Unicity Trust Base v2 bundle holding one genesis entry with the members, epoch and
+	// network of the producer's trust base (weights are the unit stakes; the quorum is floor(2W/3)+1 of the total).
+	v2Bundle := func(t *types.RootTrustBaseV1) (*types.RootTrustBaseV2, []byte, error) {
+		e := types.NewRootTrustBaseV2()
+		e.NetworkID, e.Epoch, e.EpochStart = t.NetworkID, t.Epoch, t.EpochStart
+		e.RootNodes = t.RootNodes
+		e.QuorumThreshold = t.QuorumThreshold
+		e.StateHash, e.ChangeRecordHash = t.StateHash, t.ChangeRecordHash
+		e.PreviousEntryID = make([]byte, types.TrustBaseV2IDLen)
+		if err := e.Validate(); err != nil {
+			return nil, nil, fmt.Errorf("the authority is not a valid trust base v2 genesis entry: %w", err)
+		}
+		raw, err := e.MarshalCBOR()
+		if err != nil {
+			return nil, nil, err
+		}
+		bundle, err := types.EncodeTrustBaseBundle([][]byte{raw})
+		return e, bundle, err
+	}
+	tbV2, tbBytes, err := v2Bundle(tb)
 	if err != nil {
 		return nil, err
 	}
 	for _, p := range []*ucfixture.Producer{prodS, prodOther, prodOtherS} {
-		b, err := p.TrustBaseCBOR()
+		_, b, err := v2Bundle(p.TrustBase())
 		if err != nil || !bytes.Equal(b, tbBytes) {
 			return nil, errors.New("the fixture producers do not share one authority")
 		}
@@ -722,20 +741,9 @@ func Generate(aggregatorCommit string) (Files, error) {
 	}
 
 	files["authority/trust-base.cbor"] = tbBytes
-	jsonOf := func(file string, t *types.RootTrustBaseV1) error {
-		b, err := json.MarshalIndent(t, "", "  ")
-		if err != nil {
-			return err
-		}
-		files[strings.TrimSuffix(file, ".cbor")+".json"] = append(b, '\n')
-		return nil
-	}
-	if err := jsonOf("authority/trust-base.cbor", tb); err != nil {
-		return nil, err
-	}
 
 	// other authorities (reused node IDs, other networks/epochs/keys)
-	mkTB := func(network types.NetworkID, keys func(i int) abcrypto.Signer, opts ...types.Option) (*types.RootTrustBaseV1, []byte, error) {
+	mkTB := func(network types.NetworkID, keys func(i int) abcrypto.Signer, opts ...types.Option) (*types.RootTrustBaseV2, []byte, error) {
 		var nodes []*types.NodeInfo
 		for i := 0; i < ucfixture.RootNodes; i++ {
 			v, err := keys(i).Verifier()
@@ -752,8 +760,7 @@ func Generate(aggregatorCommit string) (Files, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		b, err := t.MarshalCBOR()
-		return t, b, err
+		return v2Bundle(t)
 	}
 	fixtureKey := func(i int) abcrypto.Signer {
 		k := sha256.Sum256([]byte(fmt.Sprintf("uc-consolidation fixture key %s %d", "root", i)))
@@ -765,7 +772,7 @@ func Generate(aggregatorCommit string) (Files, error) {
 		s, _ := abcrypto.NewInMemorySecp256K1SignerFromKey(k[:])
 		return s
 	}
-	tbs := map[string]types.RootTrustBase{"authority/trust-base.cbor": tb}
+	tbs := map[string]types.RootTrustBase{"authority/trust-base.cbor": tbV2}
 	addTB := func(file string, network types.NetworkID, keys func(int) abcrypto.Signer, opts ...types.Option) error {
 		t, b, err := mkTB(network, keys, opts...)
 		if err != nil {
@@ -773,7 +780,7 @@ func Generate(aggregatorCommit string) (Files, error) {
 		}
 		files[file] = b
 		tbs[file] = t
-		return jsonOf(file, t)
+		return nil
 	}
 	if err := addTB("authority/other-network.cbor", types.NetworkMainNet, fixtureKey, types.WithEpochStart(1)); err != nil {
 		return nil, err
@@ -934,7 +941,7 @@ func Generate(aggregatorCommit string) (Files, error) {
 	confHash := byName["golden-two-leaf"].uc.ShardConfHash
 	shardConf := byName["sharded-absent"].uc.ShardConfHash
 	mk := func(desc, tbFile, shard, next, pin string) Context {
-		return Context{Description: desc, TrustBase: tbFile, Shard: shard, NextEpochStart: next, ShardConfHash: pin}
+		return Context{Description: desc, TrustBaseBundle: tbFile, Shard: shard, NextEpochStart: next, ShardConfHash: pin}
 	}
 	contexts := map[string]Context{
 		"default":                   mk("trusted authority of the fixture network, the aggregation partition (7), unsharded, no end boundary", "authority/trust-base.cbor", "", "0", ""),
@@ -958,10 +965,6 @@ func Generate(aggregatorCommit string) (Files, error) {
 	contexts["epoch-end-after"] = mk("authenticated end of the epoch is after the certified round (still valid)", "authority/trust-base.cbor", "", fmt.Sprint(gr+1), "")
 	contexts["epoch-end-at-round"] = mk("the next epoch starts at the certified round: the seal is at the retirement boundary and not valid", "authority/trust-base.cbor", "", fmt.Sprint(gr), "")
 
-	for n, c := range contexts {
-		c.TrustBaseJSON = strings.TrimSuffix(c.TrustBase, ".cbor") + ".json"
-		contexts[n] = c
-	}
 	cb, err := json.MarshalIndent(contexts, "", "  ")
 	if err != nil {
 		return nil, err
@@ -978,7 +981,7 @@ func Generate(aggregatorCommit string) (Files, error) {
 			return "", nil, errors.New("bad query")
 		}
 		c := contexts[ctxName]
-		verdict, snap := Verdict(w, [KeySize]byte(q), c, tbs[c.TrustBase])
+		verdict, snap := Verdict(w, [KeySize]byte(q), c, tbs[c.TrustBaseBundle])
 		return verdict, snap, nil
 	}
 	byPath := map[string]Vector{}
