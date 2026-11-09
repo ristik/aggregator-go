@@ -11,6 +11,7 @@ import (
 
 	"github.com/unicitynetwork/bft-go-base/types"
 
+	"github.com/unicitynetwork/aggregator-go/internal/bft"
 	"github.com/unicitynetwork/aggregator-go/internal/bft/rest"
 	"github.com/unicitynetwork/aggregator-go/internal/config"
 	"github.com/unicitynetwork/aggregator-go/internal/events"
@@ -188,9 +189,25 @@ func main() {
 	}
 	threadSafeSmt := smt.NewThreadSafeSMT(smtInstance)
 
-	// Create trust base manager if BFT is enabled, otherwise use trust base store as the provider
+	// The signed trust-base history (record version 2), when configured, is loaded before anything that could use a trust base. An invalid
+	// configuration, or one that contradicts the trust base the aggregator itself holds, stops the start; it never falls back to the version 1 trust
+	// bases. An active epoch the history does not cover yet is not an error: the prefix is served and the feeder below extends it.
+	var guard *utb.Guard
+	if cfg.UTB.Enabled() {
+		var err error
+		guard, err = loadTrustBaseHistory(ctx, cfg, trustBaseStore, storageInstance)
+		if err != nil {
+			log.WithComponent("main").Error("Trust-base history refused", "error", err.Error())
+			gracefulExit(asyncLogger, 1)
+		}
+	}
+
+	// Create trust base manager if BFT is enabled, otherwise use trust base store as the provider. With the signed history the BFT client authenticates
+	// from the history only: no version 1 manager and no root REST client.
 	var trustBaseProvider interfaces.TrustBaseProvider
-	if cfg.BFT.Enabled {
+	if cfg.BFT.Enabled && guard != nil {
+		trustBaseProvider = bft.NewUTBProvider(guard.History())
+	} else if cfg.BFT.Enabled {
 		bftRestClient := rest.NewBFTRestClient(cfg.BFT.RPCAddress)
 		trustBaseProvider = trustbase.NewTrustBaseManager(log, trustBaseStore, bftRestClient, trustBaseValidator)
 	} else {
@@ -273,12 +290,7 @@ func main() {
 
 	// The signed trust-base history (record version 2), when configured. An invalid configuration, or one that disagrees with the trust base the
 	// aggregator itself holds, stops the start; it never falls back to the version 1 trust bases.
-	if cfg.UTB.Enabled() {
-		guard, err := loadTrustBaseHistory(ctx, cfg, aggregatorService, storageInstance)
-		if err != nil {
-			log.WithComponent("main").Error("Trust-base history refused", "error", err.Error())
-			gracefulExit(asyncLogger, 1)
-		}
+	if guard != nil {
 		server.SetTrustBaseHistory(guard)
 		go refreshTrustBaseHistory(ctx, log, guard.History())
 		epoch, id := guard.History().Tip()
@@ -581,7 +593,7 @@ const trustBaseHistoryRefreshInterval = 10 * time.Second
 // loadTrustBaseHistory opens the configured bundle together with the durable store, and checks the held history against the trust base the aggregator
 // already holds. The storage must offer a durable store: the history never runs memory-only, so a restart cannot fall back to a shorter one. An active
 // epoch the history does not cover yet is not an error (the aggregator starts, degraded, until an append covers it); a contradiction is.
-func loadTrustBaseHistory(ctx context.Context, cfg *config.Config, svc service.TrustBaseService, storage interface{}) (*utb.Guard, error) {
+func loadTrustBaseHistory(ctx context.Context, cfg *config.Config, v1 interfaces.TrustBaseStorage, storage interface{}) (*utb.Guard, error) {
 	pin, err := cfg.UTB.Pin()
 	if err != nil {
 		return nil, err
@@ -598,8 +610,8 @@ func loadTrustBaseHistory(ctx context.Context, cfg *config.Config, svc service.T
 	if err != nil {
 		return nil, err
 	}
-	guard := utb.NewGuard(history, svc.GetLatestTrustBase)
-	if err := guard.CheckInstalled(ctx, svc.GetTrustBases); err != nil {
+	guard := utb.NewGuard(history, v1.GetLatest)
+	if err := guard.CheckInstalled(ctx, v1.GetTrustBases); err != nil {
 		return nil, err
 	}
 	return guard, nil

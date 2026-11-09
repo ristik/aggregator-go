@@ -178,6 +178,15 @@ func (s *Server) trustBaseV2Health(c *gin.Context, status *api.HealthStatus) {
 	default:
 		degrade("trustBaseV2", "not served: "+err.Error())
 	}
+	if err, at, ok := s.utb.History().FeedStatus(); !at.IsZero() {
+		// a catch-up against the roots has run: report the last coherent answer (no freshness claim) and degrade on a failed one
+		if !ok.IsZero() {
+			status.AddDetail("trustBaseV2FeedLastAnswer", ok.UTC().Format(time.RFC3339))
+		}
+		if err != nil {
+			degrade("trustBaseV2Feed", fmt.Sprintf("last catch-up failed at %s: %v", at.UTC().Format(time.RFC3339), err))
+		}
+	}
 	if err, at := s.utb.History().Status(); err != nil {
 		degrade("trustBaseV2Refresh", fmt.Sprintf("failed at %s: %v", at.UTC().Format(time.RFC3339), err))
 	}

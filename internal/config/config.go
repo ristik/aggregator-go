@@ -377,6 +377,8 @@ type BFTConfig struct {
 	BootstrapConnectRetry      int           `mapstructure:"bootstrap_connect_retry"`
 	BootstrapConnectRetryDelay int           `mapstructure:"bootstrap_connect_retry_delay"`
 	StubDelay                  time.Duration `mapstructure:"stub_delay"` // Delay for BFT stub (testing only)
+	// UTBPollInterval is the mean interval (+-20%) of the poll that wakes the trust-base catch-up worker; 0 means 30s. Only with UTB_BUNDLE_FILE.
+	UTBPollInterval time.Duration `mapstructure:"utb_poll_interval"`
 
 	// HeartbeatInterval how often to perform the inactivity check.
 	HeartbeatInterval time.Duration `mapstructure:"heartbeat_interval"`
@@ -559,6 +561,7 @@ func Load() (*Config, error) {
 		BootstrapConnectRetryDelay: getEnvIntOrDefault("BFT_BOOTSTRAP_CONNECT_RETRY_DELAY", 5),
 		HeartbeatInterval:          getEnvDurationOrDefault("BFT_HEARTBEAT_INTERVAL", "1s"),
 		InactivityTimeout:          getEnvDurationOrDefault("BFT_INACTIVITY_TIMEOUT", "5s"),
+		UTBPollInterval:            getEnvDurationOrDefault("UTB_POLL_INTERVAL", "30s"),
 	}
 	if config.BFT.Enabled {
 		config.BFT.KeyConf = config.Signing.KeyConf

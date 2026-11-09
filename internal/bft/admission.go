@@ -25,8 +25,8 @@ const (
 // IntakeTrustBases is the view of the trust base history the certification intake needs. Nothing
 // here talks to the network except AdmitNext, which only the catch-up worker calls.
 type IntakeTrustBases interface {
-	// GetByEpochLocal returns an admitted trust base from the local store, never from the BFT node.
-	GetByEpochLocal(ctx context.Context, epoch uint64) (*types.RootTrustBaseV1, error)
+	// GetByEpochLocal returns an admitted trust base (any record version) from the local store, never from the BFT node.
+	GetByEpochLocal(ctx context.Context, epoch uint64) (types.RootTrustBase, error)
 	// Head is the highest admitted epoch (the history below it is contiguous).
 	Head(ctx context.Context) (uint64, error)
 	// AdmitNext fetches, verifies and stores the epoch after the head.
@@ -39,8 +39,12 @@ var errHeadUnsupported = errors.New("the trust base store does not report its he
 // localHistory adapts a plain trust base store, which has no head and no way to fetch more.
 type localHistory struct{ store TrustBaseStore }
 
-func (l localHistory) GetByEpochLocal(ctx context.Context, epoch uint64) (*types.RootTrustBaseV1, error) {
-	return l.store.GetByEpoch(ctx, epoch)
+func (l localHistory) GetByEpochLocal(ctx context.Context, epoch uint64) (types.RootTrustBase, error) {
+	tb, err := l.store.GetByEpoch(ctx, epoch)
+	if err != nil || tb == nil {
+		return nil, err
+	}
+	return tb, nil
 }
 
 func (localHistory) Head(context.Context) (uint64, error) {
@@ -62,6 +66,10 @@ type peerSet map[peer.ID]struct{}
 // Nothing received from the network (a UC, a bootstrap peer, an unverified answer) adds an ID.
 type Membership struct {
 	history IntakeTrustBases
+	// headFallback (signed trust-base history): when the live epoch is not held, e.g. after a restart with a fresh store, the newest held committee
+	// stands in for it, so that the roots which can answer a handshake are admitted. It grants no authority: every certificate is still verified under
+	// its own epoch's held entry.
+	headFallback bool
 
 	set  atomic.Pointer[peerSet]
 	live atomic.Uint64 // E
@@ -116,6 +124,7 @@ func (m *Membership) refreshLocked(ctx context.Context) error {
 		// a failed head read must not shrink the set to the live epoch
 		return fmt.Errorf("failed to read the admitted head: %w", err)
 	}
+	heldHead := head
 	if head < live {
 		head = live
 	}
@@ -154,6 +163,28 @@ func (m *Membership) refreshLocked(ctx context.Context) error {
 			next[id] = struct{}{}
 		}
 		if e == live {
+			haveLive = true
+		}
+	}
+	if !haveLive && m.headFallback && heldHead > 0 {
+		for _, e := range []uint64{heldHead - 1, heldHead} {
+			if e == 0 {
+				continue
+			}
+			tb, err := m.history.GetByEpochLocal(ctx, e)
+			if errors.Is(err, interfaces.ErrTrustBaseNotFound) {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("failed to load trust base for epoch %d: %w", e, err)
+			}
+			ids, err := rootNodesIDSlice(tb)
+			if err != nil {
+				return fmt.Errorf("epoch %d: %w", e, err)
+			}
+			for _, id := range ids {
+				next[id] = struct{}{}
+			}
 			haveLive = true
 		}
 	}

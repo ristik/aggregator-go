@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -233,6 +234,21 @@ func TestPutStaysAsItWasAndTheHistoryGrowsOnlyByAppend(t *testing.T) {
 	_, err = f.hist.Refresh(context.Background())
 	require.Error(t, err)
 	require.Contains(t, f.do(http.MethodGet, "/health").Body.String(), "trustBaseV2Refresh")
+}
+
+// The feeder is visible on the health check: a failed catch-up degrades it, a coherent answer is reported with its time (no freshness claim).
+func TestHealthReportsTheFeederOutcome(t *testing.T) {
+	f := newUTBFixture(t, false, 4, 3, 3)
+	f.hist.NoteFeed(errors.New("no root answered"))
+	body := f.do(http.MethodGet, "/health").Body.String()
+	require.Contains(t, body, `"status":"degraded"`)
+	require.Contains(t, body, "trustBaseV2Feed")
+	require.NotContains(t, body, "trustBaseV2FeedLastAnswer", "a failure is not an answer")
+
+	f.hist.NoteFeed(nil)
+	body = f.do(http.MethodGet, "/health").Body.String()
+	require.Contains(t, body, "trustBaseV2FeedLastAnswer")
+	require.NotContains(t, body, `"trustBaseV2Feed"`)
 }
 
 func TestWithoutAHistoryTheRouteIsTheV1Route(t *testing.T) {
