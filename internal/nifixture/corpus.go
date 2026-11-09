@@ -17,7 +17,9 @@ import (
 
 	"golang.org/x/mod/modfile"
 
-	"github.com/unicitynetwork/bft-core/rootchain/testutils/ucfixture"
+	"github.com/unicitynetwork/aggregator-go/internal/consolidationcorpus"
+
+	"github.com/unicitynetwork/aggregator-go/internal/ucfixture"
 	abcrypto "github.com/unicitynetwork/bft-go-base/crypto"
 	"github.com/unicitynetwork/bft-go-base/types"
 )
@@ -703,20 +705,11 @@ func Generate(aggregatorCommit string) (Files, error) {
 	// The authority is published as a Unicity Trust Base v2 bundle holding one genesis entry with the members, epoch and
 	// network of the producer's trust base (weights are the unit stakes; the quorum is floor(2W/3)+1 of the total).
 	v2Bundle := func(t *types.RootTrustBaseV1) (*types.RootTrustBaseV2, []byte, error) {
-		e := types.NewRootTrustBaseV2()
-		e.NetworkID, e.Epoch, e.EpochStart = t.NetworkID, t.Epoch, t.EpochStart
-		e.RootNodes = t.RootNodes
-		e.QuorumThreshold = t.QuorumThreshold
-		e.StateHash, e.ChangeRecordHash = t.StateHash, t.ChangeRecordHash
-		e.PreviousEntryID = make([]byte, types.TrustBaseV2IDLen)
-		if err := e.Validate(); err != nil {
-			return nil, nil, fmt.Errorf("the authority is not a valid trust base v2 genesis entry: %w", err)
-		}
-		raw, err := e.MarshalCBOR()
+		bundle, err := consolidationcorpus.AuthorityBundle(t)
 		if err != nil {
 			return nil, nil, err
 		}
-		bundle, err := types.EncodeTrustBaseBundle([][]byte{raw})
+		e, err := consolidationcorpus.DecodeAuthority(bundle)
 		return e, bundle, err
 	}
 	tbV2, tbBytes, err := v2Bundle(tb)
