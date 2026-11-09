@@ -31,7 +31,7 @@ func getTrustBaseHistoryHandler(logger *logger.Logger, srv *gettrustbase.Server,
 		ctx := c.Request.Context()
 		q := c.Request.URL.Query()
 		req := &gettrustbase.Request{Version: gettrustbase.Version, Network: network,
-			MaxEntries: gettrustbase.DefaultMaxEntries, MaxBytes: gettrustbase.DefaultMaxResponse}
+			MaxEntries: types.DefaultTrustBaseMaxEntries, MaxBytes: types.DefaultTrustBaseMaxResponse}
 		var err error
 		if req.FromEpoch, err = parseUint64WithDefault(q, "from", genesisEpoch); err != nil {
 			http.Error(c.Writer, err.Error(), http.StatusBadRequest)
@@ -59,8 +59,8 @@ func getTrustBaseHistoryHandler(logger *logger.Logger, srv *gettrustbase.Server,
 		}
 		if q.Get("maxEntries") != "" {
 			n, err := parseUint64WithDefault(q, "maxEntries", 0)
-			if err != nil || n == 0 || n > gettrustbase.DefaultMaxEntries {
-				http.Error(c.Writer, fmt.Sprintf("maxEntries must be 1..%d", gettrustbase.DefaultMaxEntries), http.StatusBadRequest)
+			if err != nil || n == 0 || n > types.DefaultTrustBaseMaxEntries {
+				http.Error(c.Writer, fmt.Sprintf("maxEntries must be 1..%d", types.DefaultTrustBaseMaxEntries), http.StatusBadRequest)
 				return
 			}
 			req.MaxEntries = uint32(n)

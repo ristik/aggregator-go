@@ -71,13 +71,13 @@ func historyAt(t *testing.T, v *vectors, n int) *History {
 
 func historyFromRaw(t *testing.T, raw [][]byte, pinHex string) *History {
 	t.Helper()
-	file, err := gettrustbase.EncodeBundle(raw)
+	file, err := types.EncodeTrustBaseBundle(raw)
 	require.NoError(t, err)
-	bundle, err := gettrustbase.DecodeBundle(file, gettrustbase.BundleLimits{MaxBytes: maxBundleBytes, MaxEntries: maxBundleEntries})
+	bundle, err := types.DecodeTrustBaseBundle(file, types.TrustBaseLimits{MaxBytes: maxBundleBytes, MaxEntries: maxBundleEntries})
 	require.NoError(t, err)
 	pin, err := ParsePin(pinHex)
 	require.NoError(t, err)
-	require.NoError(t, gettrustbase.VerifyBundle(bundle, pin))
+	require.NoError(t, types.VerifyTrustBaseBundle(bundle, pin))
 	h, err := open(memorydb.New(), bundle, pin)
 	require.NoError(t, err)
 	return h
@@ -179,7 +179,7 @@ func TestOpenInstallsTheShippedHistoryAppendOnly(t *testing.T) {
 	v := loadVectors(t)
 	dir := t.TempDir()
 	write := func(name string, raw [][]byte) string {
-		file, err := gettrustbase.EncodeBundle(raw)
+		file, err := types.EncodeTrustBaseBundle(raw)
 		require.NoError(t, err)
 		p := filepath.Join(dir, name)
 		require.NoError(t, os.WriteFile(p, file, 0o600))
