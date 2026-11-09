@@ -152,6 +152,9 @@ func (c *BFTClientImpl) handleCombinedResponse(ctx context.Context, cr *certific
 	if c.utb != nil && len(updates) > 0 {
 		added, gap, err := c.utb.Ingest(ctx, updates)
 		switch {
+		case errors.Is(err, utb.ErrLocal), errors.Is(err, context.Canceled):
+			// this process's store (or a cancelled caller), not a bad attachment
+			c.logger.WithContext(ctx).Error("trust-base update not stored", "error", err.Error())
 		case err != nil:
 			c.logger.WithContext(ctx).Warn("dropping an invalid trust-base update", "error", err.Error())
 		case gap:

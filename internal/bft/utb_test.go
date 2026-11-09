@@ -27,6 +27,13 @@ import (
 // threeEpochs is a client holding only the genesis of a three-epoch chain and an in-process root holding all three entries.
 func threeEpochs(t *testing.T, partition types.PartitionID) (*BFTClientImpl, *utb.History, *gettrustbase.Server, []fixtureMember, []byte, []byte) {
 	t.Helper()
+	c, h, srv, _, j, e2raw, e3raw := threeEpochsWithGenesisMembers(t, partition)
+	return c, h, srv, j, e2raw, e3raw
+}
+
+// threeEpochsWithGenesisMembers is threeEpochs that also returns the genesis committee (the epoch 1 signers).
+func threeEpochsWithGenesisMembers(t *testing.T, partition types.PartitionID) (*BFTClientImpl, *utb.History, *gettrustbase.Server, []fixtureMember, []fixtureMember, []byte, []byte) {
+	t.Helper()
 	const net types.NetworkID = 5
 	k, j, l := fixtureMembers(t, 4), fixtureMembers(t, 4), fixtureMembers(t, 4)
 	g := fixtureEntryOf(t, net, 1, 1, k, nil, nil)
@@ -50,7 +57,7 @@ func threeEpochs(t *testing.T, partition types.PartitionID) (*BFTClientImpl, *ut
 	require.NoError(t, err)
 	c, err := NewBFTClient(context.Background(), &config.BFTConfig{ShardConf: &types.PartitionDescriptionRecord{NetworkID: net, PartitionID: partition}}, nil, NewUTBProvider(h), nil, log, nil)
 	require.NoError(t, err)
-	return c, h, srv, j, e2raw, e3raw
+	return c, h, srv, k, j, e2raw, e3raw
 }
 
 type countingFetcher struct {
@@ -97,6 +104,41 @@ func TestAttachedEntriesAreAppendedBeforeAndIndependentlyOfTheCertificate(t *tes
 		require.Equal(t, uint64(2), tipOf(h2), "status %d: the valid entry is kept", status)
 		require.Nil(t, c2.luc.Load(), "status %d: a refused certificate advances nothing", status)
 		require.Equal(t, uint64(2), c2.admittedHead.Load(), "status %d: the admitted head follows the history", status)
+	}
+}
+
+// The other direction: a valid certificate is accepted whatever is wrong with the attachment. A forged or corrupt entry is dropped (the tip does not move)
+// and a gap only wakes the worker; neither costs the certificate.
+func TestABadAttachmentNeverCostsAValidCertificate(t *testing.T) {
+	flipped := func(raw []byte) []byte {
+		out := append([]byte(nil), raw...)
+		out[len(out)-1] ^= 0xff
+		return out
+	}
+	cases := map[string]struct {
+		attach func(e2, e3 []byte) [][]byte
+		wakes  bool
+	}{
+		"garbage":                {func(e2, e3 []byte) [][]byte { return [][]byte{{0xde, 0xad}} }, false},
+		"a corrupted entry":      {func(e2, e3 []byte) [][]byte { return [][]byte{flipped(e2)} }, false},
+		"a gap":                  {func(e2, e3 []byte) [][]byte { return [][]byte{e3} }, true},
+		"a valid entry then bad": {func(e2, e3 []byte) [][]byte { return [][]byte{e2, flipped(e3)} }, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			c, h, _, k, j, e2raw, e3raw := threeEpochsWithGenesisMembers(t, fixturePartition)
+			c.roundManager = &stubRoundManager{} // a valid certificate starts the next round
+			// the certificate is valid for the history as it stands after the valid prefix of the attachment
+			wantTip, cr := uint64(1), signedResponse(t, 1, k[:3])
+			if name == "a valid entry then bad" {
+				wantTip, cr = 2, signedResponse(t, 2, j[:3])
+			}
+			err := c.handleCombinedResponse(context.Background(), cr, tc.attach(e2raw, e3raw))
+			require.NoError(t, err, "the certificate of the held epoch is judged on its own")
+			require.NotNil(t, c.luc.Load(), "the valid certificate was accepted")
+			require.Equal(t, wantTip, tipOf(h), "only valid, in-order entries move the tip")
+			require.Equal(t, tc.wakes, woken(c), "only a gap wakes the worker")
+		})
 	}
 }
 
