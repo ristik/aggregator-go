@@ -218,11 +218,6 @@ func NewBFTClient(
 		// the shard's configuration changes live (validator-registry kinds 6 and 8): successors are fetched from the root and checked against
 		// the hash its seal committed to
 		bftClient.SetShardConfSource(rest.NewBFTRestClient(conf.RPCAddress))
-		// the worker runs for the life of the process, on the first lookup, on every replica: activation (a leader, a follower that is promoted) is
-		// not needed to resolve the configurations the stored view of the latest block waits for
-		if bftClient.follow != nil {
-			bftClient.follow.autostart = true
-		}
 	}
 	bftClient.status.Store(idle)
 	bftClient.luc.Store(luc)
@@ -1149,10 +1144,17 @@ func (c *BFTClientImpl) noteAuthenticated(ctx context.Context, uc *types.Unicity
 // certificate commits to is persisted (BFT_SHARD_CONF_CHECKPOINT_FILE) and resumed from at restart. Without a source the client keeps verifying
 // against the configuration it started with. Call before Start.
 func (c *BFTClientImpl) SetShardConfSource(src ShardConfSource) {
+	c.setShardConfSource(src, true)
+}
+
+// setShardConfSource is SetShardConfSource; autostart runs the worker on the first lookup (every source installed through the public setter
+// and the constructor), tests that step the worker themselves turn it off.
+func (c *BFTClientImpl) setShardConfSource(src ShardConfSource, autostart bool) {
 	if src == nil || c.conf == nil || c.conf.ShardConf == nil {
 		return
 	}
 	f := newShardConfFollower(src, c.conf.ShardConf, c.authn.currentConfHash())
+	f.autostart = autostart
 	f.deliver = c.redeliver
 	f.checkpoint = c.conf.ShardConfCheckpointFile
 	c.authn.withShardConfFollower(f, c.authn.currentConfHash())

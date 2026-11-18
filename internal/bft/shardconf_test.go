@@ -100,7 +100,7 @@ func newFollowFixture(t *testing.T) *followFixture {
 	f.c.conf.ShardConf = f.pdr0
 	f.c.conf.ShardConfCheckpointFile = f.checkpoint
 	f.c.authn.withShardConfHash(f.h0)
-	f.c.SetShardConfSource(f.srv)
+	f.c.setShardConfSource(f.srv, false)
 	return f
 }
 
@@ -404,7 +404,7 @@ func TestARestartResumesFromTheAuthenticatedCheckpoint(t *testing.T) {
 	f.srv.calls = nil
 	f.c.follow, f.c.reinject = nil, nil
 	f.c.authn.withShardConfHash(f.h0)
-	f.c.SetShardConfSource(f.srv)
+	f.c.setShardConfSource(f.srv, false)
 	require.Equal(t, f.h2, f.c.authn.currentConfHash())
 	require.NoError(t, f.verify(f.cert(t, f.h2)))
 	require.NoError(t, f.verify(f.cert(t, f.h0)), "and the file configuration")
@@ -420,14 +420,14 @@ func TestARestartResumesFromTheAuthenticatedCheckpoint(t *testing.T) {
 	require.NoError(t, saveConfCheckpoint(f.checkpoint, &forged, uc))
 	f.c.follow, f.c.reinject = nil, nil
 	f.c.authn.withShardConfHash(f.h0)
-	f.c.SetShardConfSource(f.srv)
+	f.c.setShardConfSource(f.srv, false)
 	require.Equal(t, f.h0, f.c.authn.currentConfHash(), "a checkpoint that does not authenticate is ignored")
 	// so is one whose certificate is not the quorum's
 	bad := utbtest.CertificateWithConf(t, 5, 2, 999, f.signers[:1], make([]byte, 32), f.h2)
 	require.NoError(t, saveConfCheckpoint(f.checkpoint, pdr, bad))
 	f.c.follow, f.c.reinject = nil, nil
 	f.c.authn.withShardConfHash(f.h0)
-	f.c.SetShardConfSource(f.srv)
+	f.c.setShardConfSource(f.srv, false)
 	require.Equal(t, f.h0, f.c.authn.currentConfHash())
 	require.NoError(t, os.WriteFile(f.checkpoint, raw, 0o600))
 }
@@ -1110,5 +1110,26 @@ func TestAViewWithTwoNeedsAlwaysCompletesItsCallback(t *testing.T) {
 		require.Eventually(t, func() bool { return ran.Load() >= 1 }, 5*time.Second, time.Millisecond, "round %d: the callback never ran", i)
 		time.Sleep(time.Millisecond)
 		require.EqualValues(t, 1, ran.Load(), "round %d: exactly once", i)
+	}
+}
+
+// A source installed through the public setter starts the worker on its first lookup, like the constructor's.
+func TestASourceInstalledThroughTheSetterStartsTheWorker(t *testing.T) {
+	c, _, _, _, _, _ := threeEpochs(t, utbtest.Partition)
+	node := &types.NodeInfo{NodeID: "a1", SigKey: []byte{2, 1}, Stake: 1}
+	pdr0 := &types.PartitionDescriptionRecord{Version: 1, NetworkID: 5, PartitionID: utbtest.Partition, PartitionTypeID: 7, TypeIDLen: 8, UnitIDLen: 256,
+		T2Timeout: time.Second, Epoch: 0, EpochStart: 1, Validators: []*types.NodeInfo{node}}
+	pdr1 := *pdr0
+	pdr1.Epoch, pdr1.EpochStart = 1, 100
+	c.conf.ShardConf = pdr0
+	c.authn.withShardConfHash(confHashOf(t, pdr0))
+	c.SetShardConfSource(&instantSource{pdr: &pdr1}) // the public setter
+	require.True(t, c.follow.autostart)
+	done := make(chan struct{})
+	require.Equal(t, confQueued, c.follow.request(types.ShardID{}, confHashOf(t, &pdr1), []uint64{1}, &confCallback{fn: func() { close(done) }}))
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no worker ran for a source installed through the setter")
 	}
 }
