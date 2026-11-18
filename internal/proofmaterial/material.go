@@ -4,7 +4,6 @@
 package proofmaterial
 
 import (
-	"bytes"
 	"context"
 	"crypto"
 	"crypto/sha256"
@@ -209,26 +208,33 @@ func (s *StaticTopology) Topology(partition types.PartitionID) (types.PartitionV
 	return s.topo, true
 }
 
-// Follow moves the pin of one shard from the configuration hash previous to adopted, when the shard's configuration changed live
-// (validator-registry kinds 6 and 8): only a pin that is exactly previous moves, so a pin the operator set to anything else stays. It reports
-// whether the pin moved. Topology returns a snapshot that is never modified afterwards.
-func (s *StaticTopology) Follow(shard types.ShardID, previous, adopted []byte) bool {
-	if s == nil || len(adopted) != ConfHashSize {
-		return false
+// Pin is the configuration hash pinned for a shard.
+func (s *StaticTopology) Pin(shard types.ShardID) ([]byte, bool) {
+	if s == nil {
+		return nil, false
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key := shard.Key()
-	if !bytes.Equal(s.topo.ShardConfHashes[key], previous) {
-		return false
-	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	h, ok := s.topo.ShardConfHashes[shard.Key()]
+	return h, ok
+}
+
+// Overridden is a snapshot of the topology in which the given shards (keyed by ShardID.Key()) are pinned to other configuration hashes:
+// the hashes of configurations the client verified a shard moved to (validator-registry kinds 6 and 8) and the operator's pin does not
+// name yet. The receiver is not modified.
+func (s *StaticTopology) Overridden(pins map[string][]byte) *StaticTopology {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	next := make(map[string][]byte, len(s.topo.ShardConfHashes))
 	for k, v := range s.topo.ShardConfHashes {
 		next[k] = v
 	}
-	next[key] = append([]byte(nil), adopted...)
-	s.topo = types.PartitionViewTopology{Scheme: s.topo.Scheme, ShardConfHashes: next}
-	return true
+	for k, v := range pins {
+		if _, ok := next[k]; ok && len(v) == ConfHashSize {
+			next[k] = append([]byte(nil), v...)
+		}
+	}
+	return &StaticTopology{topo: types.PartitionViewTopology{Scheme: s.topo.Scheme, ShardConfHashes: next}}
 }
 
 func topologyFor(p TopologyProvider, partition types.PartitionID) (types.PartitionViewTopology, bool) {

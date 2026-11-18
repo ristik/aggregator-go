@@ -68,6 +68,12 @@ func New(t testing.TB, bits int, round uint64, stateHash []byte, rootRound uint6
 // NewForPartition is New for an arbitrary partition (validly signed by the same authority): the fixture of a
 // partition which is not the aggregation partition must be refused by every application verifier.
 func NewForPartition(t testing.TB, partition types.PartitionID, bits int, round uint64, stateHash []byte, rootRound uint64) *Fixture {
+	return NewWithConfs(t, partition, bits, round, stateHash, rootRound, nil)
+}
+
+// NewWithConfs is NewForPartition in which the shards named in confs (by ShardID.Key()) commit to the given configuration hashes: the
+// certificates of a shard after a live configuration change.
+func NewWithConfs(t testing.TB, partition types.PartitionID, bits int, round uint64, stateHash []byte, rootRound uint64, confs map[string][]byte) *Fixture {
 	scheme := Scheme(bits)
 	order, err := types.CanonicalShardOrder(scheme)
 	require.NoError(t, err)
@@ -89,6 +95,9 @@ func NewForPartition(t testing.TB, partition types.PartitionID, bits int, round 
 		leaf := types.PartitionViewLeafV1{ShardID: id, InputRecord: ir, TRHash: Hash("tr-" + id.String()), ShardConfHash: Hash("conf-" + id.String())}
 		if i == 0 {
 			leaf.TRHash = trHash
+		}
+		if h, ok := confs[id.Key()]; ok {
+			leaf.ShardConfHash = h
 		}
 		confHashes[id.Key()] = leaf.ShardConfHash
 		v.Leaves = append(v.Leaves, leaf)

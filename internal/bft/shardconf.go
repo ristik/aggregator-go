@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/unicitynetwork/bft-go-base/types"
 )
@@ -14,114 +18,316 @@ import (
 // Following the shard's configuration across a live change (validator-registry kinds 6 ReplaceAggregatorValidators and 8 UpdatePartition).
 //
 // A change replaces the shard's PartitionDescriptionRecord at an activation round: the root certifies the successor's hash in every
-// certificate of the new shard epoch, so a client that pins the hash of the configuration it started with would refuse them all. The
-// authority for a successor is the root seal itself: the shard configuration hash is part of what the seal signs, so a certificate that
-// authenticates and commits to a hash this client does not know yet is the root quorum's statement of the configuration now in force. The
-// client then fetches the configuration of the next shard epoch(s) from a root, requires it to hash to exactly that sealed value and to be
-// a successor of the configuration it holds (same network, partition and shard, a later epoch), and only then adopts it. Nothing a root
-// serves without that hash and seal is trusted, and a certificate is never accepted on an unauthenticated hash.
+// certificate of the new shard epoch, so a client that pins the hash of the configuration it started with would refuse them all.
 //
-// Certificates that commit to an earlier configuration of this shard (historical ones) keep verifying against it: every configuration
-// adopted stays in the history.
+// Authority. The shard configuration hash is part of what the root seal signs. A certificate (or partition view leaf) that authenticates
+// and commits to a hash the client does not hold is the root quorum's statement of a configuration of that shard. The client resolves the
+// hash to a configuration through a ShardConfSource (a root's public GET /api/v1/shardConf), requires the answer to hash to exactly the
+// sealed value and to be a configuration of the same network, partition and shard at the epoch asked for, and only then adds it to the
+// configurations it knows. Nothing a root serves is trusted without that hash.
+//
+// Availability. Resolution never runs on the message loop. An authentic certificate with an unknown hash is dropped with
+// ErrShardConfPending and the hash is queued (coalesced by shard and hash); one worker fetches it with a total time budget, directly at
+// the epoch the authenticated certificate names (the technical record's epoch, the input record's epoch and its successor: no search
+// across epochs), backs off exponentially after a failure, and on success hands the dropped certificate back to the message loop.
+//
+// Publication. Knowing a configuration only lets certificates that commit to it verify, so historical certificates keep verifying against
+// the configuration they were certified under and a certificate that is then discarded as stale changes nothing. The configuration of
+// the newest certificate the sequence checks accepted is published (publish), and only that is persisted in the checkpoint a restart
+// resumes from.
 
-// ShardConfSource serves the configuration of a shard epoch (a root's POST /api/v1/q3/shard-conf). Its answer is untrusted: the client
+// ShardConfSource serves the configuration of one epoch of a shard (a root's GET /api/v1/shardConf). Its answer is untrusted: the client
 // checks it against the sealed hash.
 type ShardConfSource interface {
-	ShardConfig(ctx context.Context, partition types.PartitionID, epoch uint64) (*types.PartitionDescriptionRecord, error)
+	ShardConfig(ctx context.Context, partition types.PartitionID, shard types.ShardID, epoch uint64) (*types.PartitionDescriptionRecord, error)
 }
 
-// maxConfLookahead bounds how many shard epochs ahead of the newest configuration held a sealed hash is searched for (a client that was
-// down across several changes catches up in one step).
-const maxConfLookahead = 16
+// ErrShardConfPending reports an authentic certificate whose configuration is being resolved: it is dropped and handed back on success.
+var ErrShardConfPending = errors.New("shard configuration is being resolved")
 
-// ErrShardConfUnknown reports a certificate whose sealed configuration hash is not one this client holds and cannot be followed.
-var ErrShardConfUnknown = errors.New("unknown shard configuration")
+const (
+	confFetchBudget  = 15 * time.Second // the total time one resolution may take, all attempts included
+	confBackoffFirst = time.Second
+	confBackoffMax   = time.Minute
+	maxPendingConfs  = 64
+	maxConfHints     = 4
+)
 
-type confEntry struct {
-	epoch uint64
-	hash  []byte
+type pendingConf struct {
+	shard  types.ShardID
+	sealed []byte
+	hints  []uint64
+	fails  int
+	next   time.Time
 }
 
-// shardConfFollower adopts successor configurations of the shard (see above).
+// shardConfFollower resolves and holds the configurations of the shard (and, for the consolidation topology, of its siblings).
 type shardConfFollower struct {
-	source  ShardConfSource
-	onAdopt func(previous, adopted []byte) // the pins derived from the configuration hash (the consolidation topology) follow it
+	source    ShardConfSource
+	network   types.NetworkID
+	partition types.PartitionID
+	ours      types.ShardID
+	now       func() time.Time
 
-	mu      sync.Mutex // serialises adoption
-	current *types.PartitionDescriptionRecord
+	mu      sync.Mutex
+	known   map[string]map[string]*types.PartitionDescriptionRecord // shard key -> sealed hash -> configuration
+	pending map[string]*pendingConf
+	latest  *types.PartitionDescriptionRecord // the published configuration of our shard
+	wake    chan struct{}
+	// resolved is called (outside the lock) after a resolution succeeded: the dropped certificate is re-admitted
+	resolved func()
+	// checkpoint is the file the published configuration is persisted in ("" none)
+	checkpoint string
 }
 
-// newShardConfFollower follows from the configuration the client started with.
-func newShardConfFollower(source ShardConfSource, start *types.PartitionDescriptionRecord) *shardConfFollower {
-	return &shardConfFollower{source: source, current: start}
+func newShardConfFollower(source ShardConfSource, start *types.PartitionDescriptionRecord, startHash []byte) *shardConfFollower {
+	f := &shardConfFollower{source: source, network: start.NetworkID, partition: start.PartitionID, ours: start.ShardID, now: time.Now,
+		known: map[string]map[string]*types.PartitionDescriptionRecord{}, pending: map[string]*pendingConf{}, wake: make(chan struct{}, 1), latest: start}
+	f.add(start.ShardID, startHash, start)
+	return f
 }
 
-// currentConfHash is the hash of the newest configuration held (nil: unchecked).
-func (a *ucAuthenticator) currentConfHash() []byte {
-	a.confMu.RLock()
-	defer a.confMu.RUnlock()
-	return a.shardConfHash
+func (f *shardConfFollower) add(shard types.ShardID, hash []byte, pdr *types.PartitionDescriptionRecord) {
+	k := shard.Key()
+	if f.known[k] == nil {
+		f.known[k] = map[string]*types.PartitionDescriptionRecord{}
+	}
+	f.known[k][string(hash)] = pdr
 }
 
-// knownConfHash reports whether h is the hash of a configuration of the history.
-func (a *ucAuthenticator) knownConfHash(h []byte) bool {
-	a.confMu.RLock()
-	defer a.confMu.RUnlock()
-	for _, e := range a.confs {
-		if bytes.Equal(e.hash, h) {
+// isKnown reports whether hash is a verified configuration of the shard.
+func (f *shardConfFollower) isKnown(shard types.ShardID, hash []byte) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.known[shard.Key()][string(hash)]
+	return ok
+}
+
+// request queues the resolution of the sealed hash of a shard's configuration. hints are the shard epochs it can be (from authenticated
+// records); a request already queued is coalesced and only gains hints.
+func (f *shardConfFollower) request(shard types.ShardID, sealed []byte, hints []uint64) {
+	f.mu.Lock()
+	key := shard.Key() + "/" + string(sealed)
+	if _, ok := f.known[shard.Key()][string(sealed)]; ok {
+		f.mu.Unlock()
+		return
+	}
+	p := f.pending[key]
+	if p == nil {
+		if len(f.pending) >= maxPendingConfs {
+			f.mu.Unlock()
+			return
+		}
+		p = &pendingConf{shard: shard, sealed: bytes.Clone(sealed), next: f.now()}
+		f.pending[key] = p
+	}
+	for _, h := range hints {
+		if len(p.hints) < maxConfHints && !containsEpoch(p.hints, h) {
+			p.hints = append(p.hints, h)
+		}
+	}
+	due := !p.next.After(f.now())
+	f.mu.Unlock()
+	if due {
+		select {
+		case f.wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func containsEpoch(s []uint64, v uint64) bool {
+	for _, x := range s {
+		if x == v {
 			return true
 		}
 	}
 	return false
 }
 
-// withShardConfFollower makes the authenticator follow the shard's configuration; start is the configuration it holds.
-func (a *ucAuthenticator) withShardConfFollower(f *shardConfFollower, h []byte) *ucAuthenticator {
-	a.withShardConfHash(h)
-	a.confMu.Lock()
-	if f != nil && f.current != nil {
-		a.confs[0].epoch = f.current.Epoch
+// run is the worker: one goroutine, one resolution at a time.
+func (f *shardConfFollower) run(ctx context.Context) {
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-f.wake:
+		case <-tick.C:
+		}
+		f.process(ctx)
 	}
-	a.follow = f
-	a.confMu.Unlock()
-	return a
 }
 
-// adoptConf adopts the configuration whose hash the root seal committed to, from the next shard epochs. The caller has authenticated the
-// certificate (shape, network and seal) already.
-func (a *ucAuthenticator) adoptConf(ctx context.Context, sealed []byte) error {
-	f := a.follow
+// process resolves every queued request that is due.
+func (f *shardConfFollower) process(ctx context.Context) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if a.knownConfHash(sealed) { // another certificate adopted it meanwhile
-		return nil
+	var due []*pendingConf
+	for _, p := range f.pending {
+		if !p.next.After(f.now()) {
+			due = append(due, p)
+		}
 	}
-	cur := f.current
-	for epoch := cur.Epoch + 1; epoch <= cur.Epoch+maxConfLookahead && epoch > cur.Epoch; epoch++ {
-		pdr, err := f.source.ShardConfig(ctx, cur.PartitionID, epoch)
-		if err != nil || pdr == nil {
-			if err != nil {
-				return fmt.Errorf("%w: the certificate commits to configuration %X and epoch %d of the shard could not be fetched: %w", ErrShardConfUnknown, sealed, epoch, err)
-			}
-			return fmt.Errorf("%w: the certificate commits to configuration %X and no epoch %d is served", ErrShardConfUnknown, sealed, epoch)
+	f.mu.Unlock()
+	for _, p := range due {
+		if ctx.Err() != nil {
+			return
+		}
+		f.resolve(ctx, p)
+	}
+}
+
+func (f *shardConfFollower) resolve(ctx context.Context, p *pendingConf) {
+	ctx, cancel := context.WithTimeout(ctx, confFetchBudget)
+	defer cancel()
+	f.mu.Lock()
+	hints := append([]uint64(nil), p.hints...)
+	f.mu.Unlock()
+	var last error = errors.New("no epoch to try")
+	for _, epoch := range hints {
+		pdr, err := f.source.ShardConfig(ctx, f.partition, p.shard, epoch)
+		if err != nil {
+			last = err
+			break // the source is failing: back off rather than spend the budget on the other hints
+		}
+		if pdr == nil {
+			last = fmt.Errorf("no epoch %d is served", epoch)
+			continue
 		}
 		h, err := pdr.Hash(crypto.SHA256)
-		if err != nil || pdr.Epoch != epoch || pdr.NetworkID != cur.NetworkID || pdr.PartitionID != cur.PartitionID || !pdr.ShardID.Equal(cur.ShardID) {
-			return fmt.Errorf("%w: the configuration served for epoch %d is not a configuration of this shard", ErrShardConfUnknown, epoch)
+		if err != nil || pdr.Epoch != epoch || pdr.NetworkID != f.network || pdr.PartitionID != f.partition || !pdr.ShardID.Equal(p.shard) {
+			last = fmt.Errorf("the configuration served for epoch %d is not a configuration of this shard", epoch)
+			continue
 		}
-		if !bytes.Equal(h, sealed) {
-			continue // an intermediate epoch: the history is walked in order
+		if !bytes.Equal(h, p.sealed) {
+			last = fmt.Errorf("the configuration served for epoch %d does not hash to the sealed value", epoch)
+			continue
 		}
-		previous := a.currentConfHash()
-		a.confMu.Lock()
-		a.confs = append(a.confs, confEntry{epoch: epoch, hash: bytes.Clone(h)})
-		a.shardConfHash = bytes.Clone(h)
-		a.confMu.Unlock()
-		f.current = pdr
-		if f.onAdopt != nil {
-			f.onAdopt(previous, h)
+		f.mu.Lock()
+		f.add(p.shard, h, pdr)
+		delete(f.pending, p.shard.Key()+"/"+string(p.sealed))
+		cb := f.resolved
+		f.mu.Unlock()
+		if cb != nil {
+			cb()
 		}
+		return
+	}
+	f.mu.Lock()
+	p.fails++
+	back := confBackoffFirst << min(p.fails-1, 6)
+	if back > confBackoffMax {
+		back = confBackoffMax
+	}
+	p.next = f.now().Add(back)
+	f.mu.Unlock()
+	_ = last
+}
+
+// publish makes the configuration an accepted certificate commits to the live configuration of our shard, when it is a later epoch than the
+// one published, and persists it with the certificate that authenticates it. It returns the published configuration.
+func (f *shardConfFollower) publish(uc *types.UnicityCertificate) (*types.PartitionDescriptionRecord, bool, error) {
+	f.mu.Lock()
+	pdr := f.known[f.ours.Key()][string(uc.ShardConfHash)]
+	if pdr == nil || pdr.Epoch <= f.latest.Epoch {
+		f.mu.Unlock()
+		return nil, false, nil
+	}
+	f.latest = pdr
+	path := f.checkpoint
+	f.mu.Unlock()
+	var err error
+	if path != "" {
+		err = saveConfCheckpoint(path, pdr, uc) // best effort: without it a restart resolves again from the file configuration
+	}
+	return pdr, true, err
+}
+
+// confCheckpoint is the authenticated record a restart resumes from: the published configuration and the certificate whose seal committed to
+// its hash. A restart verifies both again before trusting either.
+type confCheckpoint struct {
+	PDR *types.PartitionDescriptionRecord `json:"pdr"`
+	UC  []byte                            `json:"uc"`
+}
+
+func saveConfCheckpoint(path string, pdr *types.PartitionDescriptionRecord, uc *types.UnicityCertificate) error {
+	raw, err := types.Cbor.Marshal(uc)
+	if err != nil {
+		return err
+	}
+	out, err := json.Marshal(confCheckpoint{PDR: pdr, UC: raw})
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".shardconf-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(out); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
+func loadConfCheckpoint(path string) (*types.PartitionDescriptionRecord, *types.UnicityCertificate, error) {
+	raw, err := os.ReadFile(path) // #nosec G304 -- operator supplied local file
+	if err != nil {
+		return nil, nil, err
+	}
+	var cp confCheckpoint
+	if err := json.Unmarshal(raw, &cp); err != nil || cp.PDR == nil {
+		return nil, nil, fmt.Errorf("decoding the checkpoint: %v", err)
+	}
+	var uc types.UnicityCertificate
+	if err := types.Cbor.Unmarshal(cp.UC, &uc); err != nil {
+		return nil, nil, fmt.Errorf("decoding the checkpoint certificate: %w", err)
+	}
+	return cp.PDR, &uc, nil
+}
+
+// restore resumes from a checkpoint: it is accepted only when its certificate authenticates under the root seal (verify) and commits to
+// exactly the hash of its configuration, which is a later epoch of this shard than the one the client started with.
+func (f *shardConfFollower) restore(path string, verify func(uc *types.UnicityCertificate) error) error {
+	pdr, uc, err := loadConfCheckpoint(path)
+	if err != nil {
+		return err
+	}
+	h, err := pdr.Hash(crypto.SHA256)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(h, uc.ShardConfHash) || pdr.NetworkID != f.network || pdr.PartitionID != f.partition || !pdr.ShardID.Equal(f.ours) {
+		return errors.New("the checkpoint configuration is not the one its certificate commits to, or is of another shard")
+	}
+	f.mu.Lock()
+	later := pdr.Epoch > f.latest.Epoch
+	f.mu.Unlock()
+	if !later {
 		return nil
 	}
-	return fmt.Errorf("%w: the certificate commits to configuration %X, which is none of the next %d epochs of the shard", ErrShardConfUnknown, sealed, maxConfLookahead)
+	if err := verify(uc); err != nil {
+		return fmt.Errorf("the checkpoint certificate does not authenticate: %w", err)
+	}
+	f.mu.Lock()
+	f.add(f.ours, h, pdr)
+	f.latest = pdr
+	f.mu.Unlock()
+	return nil
+}
+
+// latestHash is the hash of the published configuration of our shard.
+func (f *shardConfFollower) latestHash() []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	h, err := f.latest.Hash(crypto.SHA256)
+	if err != nil {
+		return nil
+	}
+	return h
 }

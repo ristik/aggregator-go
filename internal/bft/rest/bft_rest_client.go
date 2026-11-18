@@ -1,7 +1,6 @@
 package rest
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -68,26 +67,36 @@ func (c *BFTRestClient) GetTrustBases(ctx context.Context, fromEpoch, toEpoch ui
 	return response.TrustBases, nil
 }
 
-// ShardConfig asks the root for the configuration of a shard epoch of the (unsplit) shard of a partition (POST /api/v1/q3/shard-conf, the
-// endpoint behind `ubft q3 shard-conf`). The answer is untrusted: the caller checks its hash against the one the root seal committed to.
-func (c *BFTRestClient) ShardConfig(ctx context.Context, partition types.PartitionID, epoch uint64) (*types.PartitionDescriptionRecord, error) {
-	body, err := json.Marshal(struct {
-		Partition uint32 `json:"partition"`
-		Epoch     uint64 `json:"epoch"`
-	}{uint32(partition), epoch})
+// ShardConfig asks the root for the configuration of one epoch of a shard (GET /api/v1/shardConf, which is public and shard-aware). The
+// answer is untrusted: the caller checks its hash against the one the root seal committed to.
+func (c *BFTRestClient) ShardConfig(ctx context.Context, partition types.PartitionID, shard types.ShardID, epoch uint64) (*types.PartitionDescriptionRecord, error) {
+	shardText, err := shard.MarshalText()
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/q3/shard-conf", bytes.NewReader(body))
+	u, err := url.Parse(c.baseURL + "/api/v1/shardConf")
+	if err != nil {
+		return nil, fmt.Errorf("invalid base URL: %w", err)
+	}
+	q := u.Query()
+	q.Set("partition", strconv.FormatUint(uint64(partition), 10))
+	q.Set("epoch", strconv.FormatUint(epoch, 10))
+	if shard.Length() > 0 {
+		q.Set("shard", string(shardText))
+	}
+	u.RawQuery = q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("unexpected HTTP status: %s", resp.Status)
 	}

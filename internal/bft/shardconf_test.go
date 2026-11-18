@@ -5,34 +5,45 @@ import (
 	"crypto"
 	"crypto/sha256"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/unicitynetwork/bft-core/network/protocol/certification"
 	"github.com/unicitynetwork/bft-go-base/types"
 
 	"github.com/unicitynetwork/aggregator-go/internal/proofmaterial"
+	"github.com/unicitynetwork/aggregator-go/internal/proofmaterial/prooftest"
 	"github.com/unicitynetwork/aggregator-go/internal/utb/utbtest"
-	"github.com/unicitynetwork/aggregator-go/pkg/api"
 )
 
 // A continuing aggregator across live shard configuration changes (validator-registry kind 6 ReplaceAggregatorValidators, which changes the
 // validators, and kind 8 UpdatePartition, which changes parameters): the root certifies the successor's hash in every certificate of the new
-// shard epoch, and the client must follow it from the root seal while old certificates keep verifying against the configuration they were
-// certified under.
+// shard epoch. The client resolves it off the message loop, keeps verifying historical certificates against the configuration they were
+// certified under, publishes only on accepted sequence progress, and resumes from an authenticated checkpoint.
 
 type confServer struct {
-	byEpoch map[uint64]*types.PartitionDescriptionRecord
-	calls   []uint64
+	byEpoch map[string]map[uint64]*types.PartitionDescriptionRecord // shard key -> epoch
+	calls   []string
 	fail    error
+	delay   time.Duration
 }
 
-func (s *confServer) ShardConfig(_ context.Context, _ types.PartitionID, epoch uint64) (*types.PartitionDescriptionRecord, error) {
-	s.calls = append(s.calls, epoch)
+func (s *confServer) ShardConfig(ctx context.Context, _ types.PartitionID, shard types.ShardID, epoch uint64) (*types.PartitionDescriptionRecord, error) {
+	s.calls = append(s.calls, shard.Key()+"@"+string(rune('0'+epoch)))
+	if s.delay > 0 {
+		select {
+		case <-time.After(s.delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if s.fail != nil {
 		return nil, s.fail
 	}
-	return s.byEpoch[epoch], nil
+	return s.byEpoch[shard.Key()][epoch], nil
 }
 
 func confHashOf(t *testing.T, p *types.PartitionDescriptionRecord) []byte {
@@ -49,10 +60,9 @@ type followFixture struct {
 	srv        *confServer
 	pdr0, pdr1 *types.PartitionDescriptionRecord
 	pdr2       *types.PartitionDescriptionRecord
-	topo       *proofmaterial.StaticTopology
 	h0, h1, h2 []byte
 	rootRound  uint64
-	trHash     []byte
+	checkpoint string
 }
 
 func newFollowFixture(t *testing.T) *followFixture {
@@ -62,7 +72,7 @@ func newFollowFixture(t *testing.T) *followFixture {
 	node := func(id string) *types.NodeInfo {
 		return &types.NodeInfo{NodeID: id, SigKey: []byte{2, byte(len(id))}, Stake: 1}
 	}
-	f := &followFixture{c: c, signers: j[:3], rootRound: 150}
+	f := &followFixture{c: c, signers: j[:3], rootRound: 150, checkpoint: filepath.Join(t.TempDir(), "checkpoint.json")}
 	f.pdr0 = &types.PartitionDescriptionRecord{Version: 1, NetworkID: 5, PartitionID: utbtest.Partition, PartitionTypeID: 7, TypeIDLen: 8, UnitIDLen: 256,
 		T2Timeout: 2500 * time.Millisecond, Epoch: 0, EpochStart: 1, Validators: []*types.NodeInfo{node("a1")}}
 	p1 := *f.pdr0
@@ -74,22 +84,30 @@ func newFollowFixture(t *testing.T) *followFixture {
 	f.h0, f.h1, f.h2 = confHashOf(t, f.pdr0), confHashOf(t, f.pdr1), confHashOf(t, f.pdr2)
 	require.NotEqual(t, f.h0, f.h1)
 	require.NotEqual(t, f.h1, f.h2)
-	f.srv = &confServer{byEpoch: map[uint64]*types.PartitionDescriptionRecord{1: f.pdr1, 2: f.pdr2}}
+	whole := types.ShardID{}.Key()
+	f.srv = &confServer{byEpoch: map[string]map[uint64]*types.PartitionDescriptionRecord{whole: {1: f.pdr1, 2: f.pdr2}}}
 	f.c.conf.ShardConf = f.pdr0
+	f.c.conf.ShardConfCheckpointFile = f.checkpoint
 	f.c.authn.withShardConfHash(f.h0)
 	f.c.SetShardConfSource(f.srv)
-	tr := sha256.Sum256([]byte("technical record"))
-	f.trHash = tr[:]
 	return f
 }
 
 func (f *followFixture) cert(t *testing.T, conf []byte) *types.UnicityCertificate {
 	f.rootRound++
-	return utbtest.CertificateWithConf(t, 5, 2, f.rootRound, f.signers, f.trHash, conf)
+	tr := sha256.Sum256([]byte("technical record"))
+	return utbtest.CertificateWithConf(t, 5, 2, f.rootRound, f.signers, tr[:], conf)
 }
 
-func (f *followFixture) verify(uc *types.UnicityCertificate) error {
-	return f.c.authn.beginIntake(context.Background()).verifyUC(uc, utbtest.Partition, types.ShardID{})
+func (f *followFixture) verify(uc *types.UnicityCertificate, hints ...uint64) error {
+	op := f.c.authn.beginIntake(context.Background())
+	op.confHints = hints
+	return op.verifyUC(uc, utbtest.Partition, types.ShardID{})
+}
+
+// resolve runs the worker's pass once, as its loop does, and reports whether the dropped certificate was handed back.
+func (f *followFixture) resolve() {
+	f.c.follow.process(context.Background())
 }
 
 func TestAContinuingAggregatorFollowsAKind6AndAKind8Boundary(t *testing.T) {
@@ -98,79 +116,149 @@ func TestAContinuingAggregatorFollowsAKind6AndAKind8Boundary(t *testing.T) {
 	require.NoError(t, f.verify(old), "the configuration it started with")
 	require.Empty(t, f.srv.calls, "a known configuration needs no fetch")
 
-	// kind 6: the first certificate of shard epoch 1 commits to the successor
+	// kind 6: the first certificate of shard epoch 1 is authentic but its configuration is unknown: dropped, nothing fetched inline
 	first := f.cert(t, f.h1)
+	require.ErrorIs(t, f.verify(first), ErrShardConfPending)
+	require.Empty(t, f.srv.calls, "resolution never runs on the message loop")
+	require.ErrorIs(t, f.verify(first), ErrShardConfPending, "a duplicate is coalesced")
+	require.Len(t, f.c.follow.pending, 1)
+	f.resolve()
+	require.Equal(t, []string{types.ShardID{}.Key() + "@1"}, f.srv.calls, "directly at the epoch the input record names, no search")
 	require.NoError(t, f.verify(first))
-	require.Equal(t, []uint64{1}, f.srv.calls)
+	require.Equal(t, f.h0, f.c.authn.currentConfHash(), "known is not published: only accepted sequence progress publishes")
+	f.c.publishConf(first)
 	require.Equal(t, f.h1, f.c.authn.currentConfHash())
-	require.NoError(t, f.verify(f.cert(t, f.h1)), "and the next ones, without another fetch")
-	require.Equal(t, []uint64{1}, f.srv.calls)
 
 	// historical certificates keep verifying against the configuration that applied to them
-	require.NoError(t, f.verify(old), "a certificate of the old validator set")
+	require.NoError(t, f.verify(old))
 	require.NoError(t, f.verify(first))
 
-	// kind 8: the next change follows the same way
-	require.NoError(t, f.verify(f.cert(t, f.h2)))
-	require.Equal(t, []uint64{1, 2}, f.srv.calls)
+	// kind 8: the technical record's epoch names the target directly, however far the input record lags
+	second := f.cert(t, f.h2)
+	require.ErrorIs(t, f.verify(second, 2), ErrShardConfPending)
+	f.resolve()
+	require.Equal(t, types.ShardID{}.Key()+"@2", f.srv.calls[len(f.srv.calls)-1])
+	require.NoError(t, f.verify(second))
+	f.c.publishConf(second)
 	require.Equal(t, f.h2, f.c.authn.currentConfHash())
 	require.NoError(t, f.verify(old))
 	require.NoError(t, f.verify(first))
 
-	// a certificate of a configuration that is none of the shard's is refused, and never adopted
+	// a certificate of a configuration that is none of the shard's is never adopted
 	foreign := sha256.Sum256([]byte("another configuration"))
-	require.ErrorIs(t, f.verify(f.cert(t, foreign[:])), ErrShardConfUnknown)
+	require.ErrorIs(t, f.verify(f.cert(t, foreign[:]), 3), ErrShardConfPending)
+	f.resolve()
+	require.ErrorIs(t, f.verify(f.cert(t, foreign[:]), 3), ErrShardConfPending, "still unknown")
 	require.Equal(t, f.h2, f.c.authn.currentConfHash())
 }
 
-func TestAClientCatchesUpAcrossSeveralChangesInOneStep(t *testing.T) {
+func TestAHistoricalCertificateNeverMovesThePublishedConfiguration(t *testing.T) {
 	f := newFollowFixture(t)
-	require.NoError(t, f.verify(f.cert(t, f.h2)), "down across both changes: the first certificate it sees is of epoch 2")
-	require.Equal(t, []uint64{1, 2}, f.srv.calls, "the epochs are walked in order")
-	require.NoError(t, f.verify(f.cert(t, f.h0)), "the configuration it started with")
-	// the epoch it skipped was never sealed to it: only the configurations it started with or adopted from a sealed hash are held
-	require.ErrorIs(t, f.verify(f.cert(t, f.h1)), ErrShardConfUnknown)
+	second := f.cert(t, f.h2)
+	require.ErrorIs(t, f.verify(second, 2), ErrShardConfPending)
+	f.resolve()
+	f.c.publishConf(second)
+	require.Equal(t, f.h2, f.c.authn.currentConfHash())
+	// an intermediate configuration, resolved later from a stale certificate that the sequence checks then discard, is known but not published
+	older := f.cert(t, f.h1)
+	require.ErrorIs(t, f.verify(older, 1), ErrShardConfPending)
+	f.resolve()
+	require.NoError(t, f.verify(older))
+	f.c.publishConf(older)
+	require.Equal(t, f.h2, f.c.authn.currentConfHash(), "an earlier epoch never lowers the published configuration")
 }
 
-func TestASuccessorIsOnlyAdoptedFromAnAuthenticatedCertificate(t *testing.T) {
+func TestAResolutionIsBackedOffCoalescedAndDoesNotBlock(t *testing.T) {
 	f := newFollowFixture(t)
-	// a certificate whose seal is not the quorum's (one signer short) never adopts a configuration
-	uc := utbtest.CertificateWithConf(t, 5, 2, 151, f.signers[:1], f.trHash, f.h1)
-	require.Error(t, f.verify(uc))
-	require.Empty(t, f.srv.calls, "the configuration is fetched only after the seal verified")
-	require.Equal(t, f.h0, f.c.authn.currentConfHash())
+	now := time.Unix(1000, 0)
+	f.c.follow.now = func() time.Time { return now }
+	f.srv.fail = errors.New("connection refused")
+	uc := f.cert(t, f.h1)
+	for i := 0; i < 5; i++ {
+		require.ErrorIs(t, f.verify(uc), ErrShardConfPending)
+	}
+	require.Empty(t, f.srv.calls)
+	f.resolve()
+	require.Len(t, f.srv.calls, 1, "one attempt: a failing source stops the pass")
+	f.resolve()
+	f.resolve()
+	require.Len(t, f.srv.calls, 1, "backed off: duplicates of the certificate cause no new attempt")
+	require.ErrorIs(t, f.verify(uc), ErrShardConfPending)
+	f.resolve()
+	require.Len(t, f.srv.calls, 1)
+	now = now.Add(2 * time.Second)
+	f.resolve()
+	require.Len(t, f.srv.calls, 2)
+	now = now.Add(time.Hour)
+	f.srv.fail = nil
+	f.resolve()
+	require.NoError(t, f.verify(uc), "the source recovered: the configuration is resolved")
+}
 
-	// a certificate of an epoch the client has not admitted yet is dropped (retryable), not adopted
-	late := utbtest.CertificateWithConf(t, 5, 9, 900, f.signers, f.trHash, f.h1)
+func TestASlowSourceCannotStallTheResolutionBudget(t *testing.T) {
+	f := newFollowFixture(t)
+	f.srv.delay = time.Hour
+	require.ErrorIs(t, f.verify(f.cert(t, f.h1)), ErrShardConfPending)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	f.c.follow.process(ctx)
+	require.Less(t, time.Since(start), 5*time.Second, "the lookup honors its context")
+}
+
+func TestTheResolvedCertificateIsHandedBackToTheMessageLoop(t *testing.T) {
+	f := newFollowFixture(t)
+	cr := &certification.CertificationResponse{Partition: utbtest.Partition}
+	f.c.pendingConf.Store(cr)
+	require.ErrorIs(t, f.verify(f.cert(t, f.h1)), ErrShardConfPending)
+	f.resolve()
+	select {
+	case got := <-f.c.reinject:
+		require.Same(t, cr, got)
+	default:
+		t.Fatal("the dropped certificate is re-admitted once its configuration is resolved")
+	}
+}
+
+func TestASuccessorIsOnlyResolvedFromAnAuthenticatedCertificate(t *testing.T) {
+	f := newFollowFixture(t)
+	// a certificate whose seal is not the quorum's never queues a resolution
+	uc := utbtest.CertificateWithConf(t, 5, 2, 151, f.signers[:1], make([]byte, 32), f.h1)
+	require.Error(t, f.verify(uc))
+	require.NotErrorIs(t, f.verify(uc), ErrShardConfPending)
+	require.Empty(t, f.c.follow.pending)
+	// a certificate of an epoch the client has not admitted yet is dropped (retryable), not queued
+	late := utbtest.CertificateWithConf(t, 5, 9, 900, f.signers, make([]byte, 32), f.h1)
 	require.ErrorIs(t, f.verify(late), ErrEpochNotAdmitted)
-	require.Equal(t, f.h0, f.c.authn.currentConfHash())
+	require.Empty(t, f.c.follow.pending)
 }
 
 func TestAServedConfigurationMustHashToTheSealedValue(t *testing.T) {
 	f := newFollowFixture(t)
-	// the root serves a configuration other than the sealed one for epoch 1, and nothing for 2..: not adopted
+	whole := types.ShardID{}.Key()
+	now := time.Unix(1000, 0)
+	f.c.follow.now = func() time.Time { return now }
+	try := func(p *types.PartitionDescriptionRecord, sealed []byte) {
+		f.srv.byEpoch[whole] = map[uint64]*types.PartitionDescriptionRecord{1: p}
+		require.ErrorIs(t, f.verify(f.cert(t, sealed)), ErrShardConfPending)
+		now = now.Add(time.Hour)
+		f.resolve()
+		require.ErrorIs(t, f.verify(f.cert(t, sealed)), ErrShardConfPending, "not resolved")
+		require.Equal(t, f.h0, f.c.authn.currentConfHash())
+	}
 	liar := *f.pdr1
 	liar.T2Timeout = time.Hour
-	f.srv.byEpoch = map[uint64]*types.PartitionDescriptionRecord{1: &liar}
-	require.ErrorIs(t, f.verify(f.cert(t, f.h1)), ErrShardConfUnknown)
-	require.Equal(t, f.h0, f.c.authn.currentConfHash())
-
-	// a configuration of another shard, or of a wrong epoch, is refused even if it hashed to the sealed value
+	try(&liar, f.h1) // does not hash to the sealed value
 	other := *f.pdr1
 	other.PartitionID++
-	f.srv.byEpoch = map[uint64]*types.PartitionDescriptionRecord{1: &other}
-	require.ErrorIs(t, f.verify(f.cert(t, confHashOf(t, &other))), ErrShardConfUnknown)
+	try(&other, confHashOf(t, &other)) // another shard's, even if it hashes to the sealed value
 	wrongEpoch := *f.pdr1
 	wrongEpoch.Epoch = 5
-	f.srv.byEpoch = map[uint64]*types.PartitionDescriptionRecord{1: &wrongEpoch}
-	require.ErrorIs(t, f.verify(f.cert(t, confHashOf(t, &wrongEpoch))), ErrShardConfUnknown)
-
-	// an unreachable root fails closed, and a later retry succeeds
-	f.srv.fail = errors.New("connection refused")
-	require.ErrorIs(t, f.verify(f.cert(t, f.h1)), ErrShardConfUnknown)
-	f.srv.fail = nil
-	f.srv.byEpoch = map[uint64]*types.PartitionDescriptionRecord{1: f.pdr1}
-	require.NoError(t, f.verify(f.cert(t, f.h1)))
+	try(&wrongEpoch, confHashOf(t, &wrongEpoch))
+	f.srv.byEpoch[whole] = map[uint64]*types.PartitionDescriptionRecord{1: f.pdr1}
+	now = now.Add(time.Hour)
+	f.resolve()
+	require.NoError(t, f.verify(f.cert(t, f.h1)), "the right one resolves")
 }
 
 func TestWithoutASourceTheClientKeepsItsStartupConfiguration(t *testing.T) {
@@ -181,18 +269,111 @@ func TestWithoutASourceTheClientKeepsItsStartupConfiguration(t *testing.T) {
 	require.Contains(t, err.Error(), "invalid shard configuration hash")
 }
 
-func TestTheConsolidationTopologyPinFollowsTheShardConfiguration(t *testing.T) {
+func TestARestartResumesFromTheAuthenticatedCheckpoint(t *testing.T) {
 	f := newFollowFixture(t)
-	other := sha256.Sum256([]byte("another shard"))
-	topo, err := proofmaterial.NewStaticTopology(types.ShardingScheme{}, map[string][]byte{types.ShardID{}.Key(): f.h0})
+	second := f.cert(t, f.h2)
+	require.ErrorIs(t, f.verify(second, 2), ErrShardConfPending)
+	f.resolve()
+	f.c.publishConf(second)
+	_, err := os.Stat(f.checkpoint)
+	require.NoError(t, err, "the published configuration is persisted")
+
+	// a restarted client starts from the file configuration and resumes from the checkpoint: no fetch, the live configuration verifies
+	f.srv.calls = nil
+	f.c.follow, f.c.reinject = nil, nil
+	f.c.authn.withShardConfHash(f.h0)
+	f.c.SetShardConfSource(f.srv)
+	require.Equal(t, f.h2, f.c.authn.currentConfHash())
+	require.NoError(t, f.verify(f.cert(t, f.h2)))
+	require.NoError(t, f.verify(f.cert(t, f.h0)), "and the file configuration")
+	require.Empty(t, f.srv.calls)
+
+	// a tampered checkpoint (a configuration its certificate does not commit to) is ignored
+	raw, err := os.ReadFile(f.checkpoint)
 	require.NoError(t, err)
-	f.c.proofTopology = topo
-	require.NoError(t, f.verify(f.cert(t, f.h1)))
-	got, ok := topo.Topology(api.AggregationPartitionID)
-	require.True(t, ok)
-	require.Equal(t, f.h1, got.ShardConfHashes[types.ShardID{}.Key()], "the pin followed the adopted configuration")
-	// the pin of an aggregation partition's shard moves only while it is exactly the configuration it followed
-	require.False(t, topo.Follow(types.ShardID{}, f.h0, f.h1), "already moved")
-	require.True(t, topo.Follow(types.ShardID{}, f.h1, f.h2))
-	require.False(t, topo.Follow(types.ShardID{}, other[:], f.h0), "a pin the operator set to anything else stays")
+	pdr, uc, err := loadConfCheckpoint(f.checkpoint)
+	require.NoError(t, err)
+	forged := *pdr
+	forged.T2Timeout = time.Hour
+	require.NoError(t, saveConfCheckpoint(f.checkpoint, &forged, uc))
+	f.c.follow, f.c.reinject = nil, nil
+	f.c.authn.withShardConfHash(f.h0)
+	f.c.SetShardConfSource(f.srv)
+	require.Equal(t, f.h0, f.c.authn.currentConfHash(), "a checkpoint that does not authenticate is ignored")
+	// so is one whose certificate is not the quorum's
+	bad := utbtest.CertificateWithConf(t, 5, 2, 999, f.signers[:1], make([]byte, 32), f.h2)
+	require.NoError(t, saveConfCheckpoint(f.checkpoint, pdr, bad))
+	f.c.follow, f.c.reinject = nil, nil
+	f.c.authn.withShardConfHash(f.h0)
+	f.c.SetShardConfSource(f.srv)
+	require.Equal(t, f.h0, f.c.authn.currentConfHash())
+	require.NoError(t, os.WriteFile(f.checkpoint, raw, 0o600))
+}
+
+// A split shard: its configuration history is its own, the source is asked for that shard, and the consolidation topology follows the
+// sibling's change too: a sharded view validates across a boundary in which two of the four shards changed.
+func TestASplitShardAndItsSiblingsFollowAKind6Boundary(t *testing.T) {
+	root := prooftest.Hash("root-1")
+	before := prooftest.New(t, 2, 7, root, 80)
+	order, err := types.CanonicalShardOrder(before.Topo.Scheme)
+	require.NoError(t, err)
+	ours, sibling, other := order[0], order[1], order[2]
+	node := func(id string) *types.NodeInfo {
+		return &types.NodeInfo{NodeID: id, SigKey: []byte{2, byte(len(id))}, Stake: 1}
+	}
+	mk := func(shard types.ShardID, epoch uint64, ids ...string) *types.PartitionDescriptionRecord {
+		p := &types.PartitionDescriptionRecord{Version: 1, NetworkID: prooftest.NetworkID, PartitionID: prooftest.Partition, PartitionTypeID: 7, TypeIDLen: 8, UnitIDLen: 256,
+			ShardID: shard, T2Timeout: time.Second, Epoch: epoch, EpochStart: 1 + epoch*100}
+		for _, id := range ids {
+			p.Validators = append(p.Validators, node(id))
+		}
+		return p
+	}
+	ours0, ours1 := mk(ours, 0, "o1"), mk(ours, 1, "o1", "o2")
+	sib1 := mk(sibling, 1, "s1", "s2") // the sibling changed too, in the same boundary
+	ourH1, sibH1 := confHashOf(t, ours1), confHashOf(t, sib1)
+	src := &confServer{byEpoch: map[string]map[uint64]*types.PartitionDescriptionRecord{ours.Key(): {1: ours1}, sibling.Key(): {1: sib1}}}
+	after := prooftest.NewWithConfs(t, prooftest.Partition, 2, 8, prooftest.Hash("root-2"), 90, map[string][]byte{ours.Key(): ourH1, sibling.Key(): sibH1})
+	require.Equal(t, before.Shard, after.Shard)
+
+	rm := &stubRoundManager{}
+	c, _ := newProofClient(t, rm, before)
+	c.shardID = ours
+	startHash := before.Topo.ShardConfHashes[ours.Key()]
+	f := newShardConfFollower(src, ours0, startHash)
+	c.follow = f
+	c.reinject = make(chan any, 4)
+	c.authn.withShardConfFollower(f, startHash)
+
+	// the certificate of the split shard after the boundary: authentic, configuration unknown; resolved for OUR shard (not the whole partition)
+	require.ErrorIs(t, c.authn.beginIntake(context.Background()).verifyUC(after.UC, prooftest.Partition, ours), ErrShardConfPending)
+	// the view of the same response is deferred until both changed shards are resolved, and requests the sibling's configuration too
+	cr := response(after, after.Raw)
+	c.stagePartitionView(t.Context(), cr)
+	require.Zero(t, c.proofStaging.Len(), "a view with unresolved configurations is deferred")
+	f.process(context.Background())
+	require.ElementsMatch(t, []string{ours.Key() + "@2", ours.Key() + "@1", sibling.Key() + "@2", sibling.Key() + "@1"}, src.calls,
+		"each shard is asked for its own history, input record epoch + 1 first (the record's epoch here is 1)")
+	require.True(t, f.isKnown(ours, ourH1))
+	require.True(t, f.isKnown(sibling, sibH1))
+	require.False(t, f.isKnown(other, sibH1), "a configuration of one shard is not known for another")
+
+	// the certificate and the view now validate across the boundary, against the operator's pins moved only for the resolved shards
+	require.NoError(t, c.authn.beginIntake(context.Background()).verifyUC(after.UC, prooftest.Partition, ours))
+	c.stagePartitionView(t.Context(), cr)
+	require.Equal(t, 1, c.proofStaging.Len(), "the sharded view validates across the boundary")
+	pins, _ := c.proofTopology.(*proofmaterial.StaticTopology).Topology(prooftest.Partition)
+	require.Equal(t, before.Topo.ShardConfHashes[ours.Key()], pins.ShardConfHashes[ours.Key()], "the operator's topology is not modified")
+
+	// a view whose changed shard serves nothing that hashes to the sealed value is never staged
+	c2, _ := newProofClient(t, rm, before)
+	c2.shardID = ours
+	f2 := newShardConfFollower(&confServer{byEpoch: map[string]map[uint64]*types.PartitionDescriptionRecord{}}, ours0, startHash)
+	c2.follow = f2
+	c2.authn.withShardConfFollower(f2, startHash)
+	c2.stagePartitionView(t.Context(), cr)
+	f2.process(context.Background())
+	c2.stagePartitionView(t.Context(), cr)
+	require.Zero(t, c2.proofStaging.Len())
+	_ = ours0
 }

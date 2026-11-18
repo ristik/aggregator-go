@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -80,22 +82,42 @@ func TestBFTRestClient_GetTrustBases(t *testing.T) {
 	}
 }
 
-func TestShardConfigPostsThePartitionAndEpochAndDecodesTheAnswer(t *testing.T) {
-	var got struct {
-		Partition uint32 `json:"partition"`
-		Epoch     uint64 `json:"epoch"`
-	}
+func TestShardConfigAsksForTheShardAndEpochAndDecodesTheAnswer(t *testing.T) {
+	left, right := types.ShardID{}.Split()
+	leftText, _ := left.MarshalText()
+	var query []url.Values
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/api/v1/q3/shard-conf", r.URL.Path)
-		require.Equal(t, http.MethodPost, r.Method)
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
-		pdr := &types.PartitionDescriptionRecord{Version: 1, NetworkID: 5, PartitionID: types.PartitionID(got.Partition), Epoch: got.Epoch}
-		require.NoError(t, json.NewEncoder(w).Encode(pdr))
+		require.Equal(t, "/api/v1/shardConf", r.URL.Path)
+		require.Equal(t, http.MethodGet, r.Method)
+		q := r.URL.Query()
+		query = append(query, q)
+		var shard types.ShardID
+		if s := q.Get("shard"); s != "" {
+			require.NoError(t, shard.UnmarshalText([]byte(s)))
+		}
+		if !shard.Equal(left) && shard.Length() != 0 {
+			http.NotFound(w, r)
+			return
+		}
+		epoch, _ := strconv.ParseUint(q.Get("epoch"), 10, 64)
+		part, _ := strconv.ParseUint(q.Get("partition"), 10, 32)
+		require.NoError(t, json.NewEncoder(w).Encode(&types.PartitionDescriptionRecord{Version: 1, NetworkID: 5, PartitionID: types.PartitionID(part), ShardID: shard, Epoch: epoch}))
 	}))
 	defer srv.Close()
-	pdr, err := NewBFTRestClient(srv.URL).ShardConfig(context.Background(), 7, 3)
+	c := NewBFTRestClient(srv.URL)
+	pdr, err := c.ShardConfig(context.Background(), 7, left, 3)
 	require.NoError(t, err)
 	require.EqualValues(t, 3, pdr.Epoch)
 	require.EqualValues(t, 7, pdr.PartitionID)
-	require.EqualValues(t, 3, got.Epoch)
+	require.True(t, pdr.ShardID.Equal(left))
+	require.Equal(t, string(leftText), query[0].Get("shard"), "the shard id is passed through")
+
+	pdr, err = c.ShardConfig(context.Background(), 7, types.ShardID{}, 1)
+	require.NoError(t, err)
+	require.Zero(t, pdr.ShardID.Length())
+	require.False(t, query[1].Has("shard"), "the unsplit shard sends none")
+
+	pdr, err = c.ShardConfig(context.Background(), 7, right, 1)
+	require.NoError(t, err)
+	require.Nil(t, pdr, "a configuration the root does not hold is none, not an error")
 }
