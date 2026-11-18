@@ -673,10 +673,15 @@ func (c *BFTClientImpl) handleCertificationResponse(ctx context.Context, cr *cer
 		cr.UC.GetRoundNumber(), cr.Technical.Round, cr.Technical.Leader))
 
 	// Only the response's own UC is processed; the view's other leaves are never dispatched.
-	c.stagePartitionViewOp(ctx, op, cr)
+	staged := c.stagePartitionViewOp(ctx, op, cr)
 
 	if err := c.handleUnicityCertificate(ctx, &cr.UC, &cr.Technical); err != nil {
 		return err
+	}
+	if staged {
+		// the sequence check accepted the certificate: only now does its view's configuration need become what a restart resumes with, and only
+		// if the view is newer than the one persisted (a delayed replay of an older response never replaces it)
+		c.noteViewConfigs(cr)
 	}
 	c.publishSidecarFill(ctx, &cr.UC)
 	return nil
@@ -1233,7 +1238,7 @@ func (c *BFTClientImpl) noteViewConfigs(cr *certification.CertificationResponse)
 		}
 	}
 	if len(needed) > 0 {
-		c.follow.setNeeded(needed)
+		c.follow.setNeeded(needed, cr.UC.GetRootRoundNumber())
 	}
 }
 
@@ -1310,15 +1315,15 @@ func (c *BFTClientImpl) stagePartitionView(ctx context.Context, cr *certificatio
 }
 
 // stagePartitionViewOp is stagePartitionView within the intake operation "op".
-func (c *BFTClientImpl) stagePartitionViewOp(ctx context.Context, op *authOp, cr *certification.CertificationResponse) {
+func (c *BFTClientImpl) stagePartitionViewOp(ctx context.Context, op *authOp, cr *certification.CertificationResponse) (staged bool) {
 	if cr.PartitionView == nil {
-		return
+		return false
 	}
 	if proofmaterial.IsUnshardedUC(&cr.UC) {
 		// the UC of an unsharded partition is complete by itself: the sidecar of a one-leaf
 		// partition is neither validated, staged, persisted nor served
 		metrics.BFTPartitionViewTotal.WithLabelValues("unsharded_skipped").Inc()
-		return
+		return false
 	}
 	if deferred, refused := c.deferViewForConfigs(cr, op); deferred || refused {
 		// a view that no lookup retained is refused, not pending
@@ -1327,21 +1332,21 @@ func (c *BFTClientImpl) stagePartitionViewOp(ctx context.Context, op *authOp, cr
 			label = "config_refused"
 		}
 		metrics.BFTPartitionViewTotal.WithLabelValues(label).Inc()
-		return
+		return false
 	}
 	result, view, err := proofmaterial.ValidateView(cr.PartitionView, &cr.UC, op.sealVerifier(), c.proofTopology)
 	metrics.BFTPartitionViewTotal.WithLabelValues(result).Inc()
 	if err != nil {
 		c.logger.WithContext(ctx).Warn("Ignoring partition view sidecar",
 			"result", result, "error", truncate(err.Error(), 200), "rootRound", cr.UC.GetRootRoundNumber())
-		return
+		return false
 	}
 	digest, _, err := proofmaterial.DigestOfUC(&cr.UC)
 	if err != nil {
-		return
+		return false
 	}
 	c.proofStaging.Put(digest, view)
-	c.noteViewConfigs(cr)
+	return true
 }
 
 func truncate(s string, n int) string {

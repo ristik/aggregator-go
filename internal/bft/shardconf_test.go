@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -521,6 +522,8 @@ func TestASplitShardAndItsSiblingsFollowAKind6Boundary(t *testing.T) {
 	// resolved and validate the same split view; without it the view is dropped
 	cp := filepath.Join(t.TempDir(), "checkpoint.json")
 	f.checkpoint = cp
+	topo.SetFollowing(map[string]bool{ours.Key(): true, sibling.Key(): true})
+	c.noteViewConfigs(cr) // the certificate was accepted by the sequence check
 	f.saveNeeded()
 	c3, _ := newProofClient(t, rm, before)
 	topo3 := c3.proofTopology.(*proofmaterial.StaticTopology)
@@ -656,10 +659,12 @@ func TestThePersistedConfigurationsAreExactlyWhatTheLatestViewNeeds(t *testing.T
 		fl.add(left, hashes[e], p)
 	}
 	fl.mu.Unlock()
+	round := uint64(1)
 	for e := uint64(1); e <= 1500; e += 100 {
-		fl.setNeeded(map[string][]byte{left.Key(): hashes[e], right.Key(): slowHash})
+		fl.setNeeded(map[string][]byte{left.Key(): hashes[e], right.Key(): slowHash}, round)
+		round++
 	}
-	fl.setNeeded(map[string][]byte{left.Key(): hashes[1500], right.Key(): slowHash})
+	fl.setNeeded(map[string][]byte{left.Key(): hashes[1500], right.Key(): slowHash}, round)
 	raw, err := os.ReadFile(fl.checkpoint + ".known")
 	require.NoError(t, err)
 	var saved []*types.PartitionDescriptionRecord
@@ -818,7 +823,7 @@ func TestTheNeedRelationSurvivesRepeatedRestarts(t *testing.T) {
 	fl.mu.Lock()
 	fl.add(right, sibHash, sib)
 	fl.mu.Unlock()
-	fl.setNeeded(map[string][]byte{right.Key(): sibHash})
+	fl.setNeeded(map[string][]byte{right.Key(): sibHash}, 1)
 	for restart := 0; restart < 3; restart++ {
 		next := newShardConfFollower(f.srv, f.pdr0, f.h0)
 		next.checkpoint = fl.checkpoint
@@ -835,4 +840,87 @@ func TestTheNeedRelationSurvivesRepeatedRestarts(t *testing.T) {
 	last := newShardConfFollower(f.srv, f.pdr0, f.h0)
 	last.restoreKnown(fl.checkpoint)
 	require.True(t, last.isKnown(right, sibHash), "still there after several restarts")
+}
+
+// A delayed replay of an older response never replaces the dependencies of a newer accepted view, and an unchanged set costs no disk write.
+func TestADelayedReplayNeverReplacesTheNewerViewsDependencies(t *testing.T) {
+	f := newFollowFixture(t)
+	fl := f.c.follow
+	fl.checkpoint = filepath.Join(t.TempDir(), "checkpoint.json")
+	left, right := types.ShardID{}.Split()
+	mk := func(shard types.ShardID, epoch uint64) (*types.PartitionDescriptionRecord, []byte) {
+		p := &types.PartitionDescriptionRecord{Version: 1, NetworkID: 5, PartitionID: utbtest.Partition, PartitionTypeID: 7, TypeIDLen: 8, UnitIDLen: 256,
+			ShardID: shard, T2Timeout: time.Second, Epoch: epoch, EpochStart: epoch + 1}
+		return p, confHashOf(t, p)
+	}
+	oldSib, oldHash := mk(right, 1)
+	newSib, newHash := mk(right, 2)
+	fl.mu.Lock()
+	fl.add(right, oldHash, oldSib)
+	fl.add(right, newHash, newSib)
+	fl.mu.Unlock()
+	fl.setNeeded(map[string][]byte{right.Key(): newHash}, 200) // the newer accepted view
+	_ = left
+	fl.setNeeded(map[string][]byte{right.Key(): oldHash}, 150) // an older authentic response resolving late: its certificate is stale
+	read := func() []*types.PartitionDescriptionRecord {
+		raw, err := os.ReadFile(fl.checkpoint + ".known")
+		require.NoError(t, err)
+		var saved []*types.PartitionDescriptionRecord
+		require.NoError(t, json.Unmarshal(raw, &saved))
+		return saved
+	}
+	require.EqualValues(t, 2, read()[len(read())-1].Epoch, "the newer view's dependency stays")
+	// a restart still has what the finalized view needs
+	next := newShardConfFollower(f.srv, f.pdr0, f.h0)
+	next.restoreKnown(fl.checkpoint)
+	require.True(t, next.isKnown(right, newHash))
+
+	// the same set again costs no write
+	info, err := os.Stat(fl.checkpoint + ".known")
+	require.NoError(t, err)
+	before := info.ModTime()
+	require.NoError(t, os.Chtimes(fl.checkpoint+".known", before.Add(-time.Hour), before.Add(-time.Hour)))
+	fl.setNeeded(map[string][]byte{right.Key(): newHash}, 300)
+	fl.saveNeeded()
+	info, err = os.Stat(fl.checkpoint + ".known")
+	require.NoError(t, err)
+	require.True(t, info.ModTime().Before(before), "an unchanged dependency set is not rewritten")
+}
+
+// Taking a response and releasing its charge are one step: the loop re-registering an expired response the moment it receives it finds its own
+// slot released, never a full budget.
+func TestAnExpiredResponseIsNotRefusedAgainstItsOwnSlot(t *testing.T) {
+	f := newFollowFixture(t)
+	fl := f.c.follow
+	left, _ := types.ShardID{}.Split()
+	// the budget is full: 255 responses registered with lookups, one more resolved and queued for handback
+	for lookup := 0; len(fl.pending)*maxConfWaiters < maxConfBacklog-maxConfWaiters; lookup++ {
+		for w := 0; w < maxConfWaiters; w++ {
+			require.Equal(t, confQueued, fl.request(left, []byte{byte(lookup), 3}, nil, new(int)))
+		}
+	}
+	last := new(int)
+	fl.mu.Lock()
+	for fl.backlogLocked() < maxConfBacklog-1 {
+		fl.ready = append(fl.ready, new(int))
+	}
+	fl.ready = append(fl.ready, last)
+	fl.mu.Unlock()
+	require.Equal(t, maxConfBacklog, fl.backlogLocked())
+	// the loop takes each response and re-registers it at once, from another goroutine, as the message loop does
+	var wg sync.WaitGroup
+	results := make(chan confResult, 1)
+	fl.deliver = func(m any) bool {
+		if m == any(last) {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				results <- fl.request(left, []byte("the expired lookup, again"), nil, m)
+			}()
+		}
+		return true
+	}
+	fl.flush()
+	wg.Wait()
+	require.Equal(t, confQueued, <-results, "its own slot was released with the delivery")
 }

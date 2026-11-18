@@ -84,23 +84,24 @@ type shardConfFollower struct {
 	ours      types.ShardID
 	now       func() time.Time
 
-	mu      sync.Mutex
-	known   map[string]map[string]*types.PartitionDescriptionRecord // shard key -> sealed hash -> configuration
-	pending map[string]*lookup                                      // the registered lookups by shard key/hash
-	ready   []any                                                   // resolved or obsolete lookups' responses, in order, charged until handed back
-	latest  *types.PartitionDescriptionRecord                       // the published configuration of our shard
-	needed  map[string][]byte                                       // the configuration hash of each shard in the latest staged view
-	wake    chan struct{}
-	// deliver hands a deferred response back to the message loop; it reports whether it was taken (the channel may be full)
+	mu          sync.Mutex
+	known       map[string]map[string]*types.PartitionDescriptionRecord // shard key -> sealed hash -> configuration
+	pending     map[string]*lookup                                      // the registered lookups by shard key/hash
+	ready       []any                                                   // resolved or obsolete lookups' responses, in order, charged until handed back
+	latest      *types.PartitionDescriptionRecord                       // the published configuration of our shard
+	needed      map[string][]byte                                       // the configuration hash of each shard in the latest accepted view
+	neededRound uint64                                                  // the root round of the certificate that view belongs to
+	wake        chan struct{}
+	// deliver hands a deferred response back to the message loop with a non-blocking send; it reports whether it was taken (the channel may be full)
 	deliver func(any) bool
 
-	flushMu sync.Mutex // one handback at a time: the head of ready is stable while it is offered
 	// checkpoint is the file the published configuration is persisted in ("" none); unsaved is the checkpoint whose save failed, retried
 	checkpoint string
 	unsaved    *checkpointJob
 	nextSave   time.Time  // the next attempt at the checkpoint
 	nextKnown  time.Time  // the next attempt at the needed-configurations file: its own schedule, never delaying the checkpoint
 	knownDirty bool       // the needed-configurations file failed to save
+	lastKnown  []byte     // what the needed-configurations file holds
 	saveMu     sync.Mutex // serializes the writers of the checkpoint and the needed-configurations file
 }
 
@@ -360,25 +361,21 @@ func (f *shardConfFollower) complete(l *lookup, hash []byte, pdr *types.Partitio
 	f.flush()
 }
 
-// flush hands the queued responses back to the message loop in order. A response stays queued, and charged, until it is taken: one that is
-// not taken stays at the head in place and the pass stops.
+// flush hands the queued responses back to the message loop in order. deliver is a non-blocking send, so it runs under the mutex: taking the
+// response and releasing its charge are one step with respect to admission (the loop re-registering an expired response finds its own slot
+// already released, never a full budget). A response that is not taken stays at the head in place, charged, and the pass stops.
 func (f *shardConfFollower) flush() {
-	f.flushMu.Lock()
-	defer f.flushMu.Unlock()
 	for {
 		f.mu.Lock()
-		deliver := f.deliver
-		if deliver == nil || len(f.ready) == 0 {
+		if f.deliver == nil || len(f.ready) == 0 {
 			f.mu.Unlock()
 			return
 		}
-		head := f.ready[0]
-		f.mu.Unlock()
-		if !deliver(head) {
+		if !f.deliver(f.ready[0]) {
+			f.mu.Unlock()
 			return
 		}
-		f.mu.Lock()
-		f.ready = f.ready[1:] // only flush removes from the head, and flushMu serializes it
+		f.ready = f.ready[1:]
 		f.mu.Unlock()
 	}
 }
@@ -570,10 +567,19 @@ func (f *shardConfFollower) saveNeeded() {
 		return
 	}
 	raw, err := json.Marshal(out)
+	f.mu.Lock()
+	unchanged := err == nil && !f.knownDirty && bytes.Equal(raw, f.lastKnown)
+	f.mu.Unlock()
+	if unchanged {
+		return // nothing to write: no disk I/O for a set that did not change
+	}
 	if err == nil {
 		err = writeFileAtomic(path+".known", raw)
 	}
 	f.mu.Lock()
+	if err == nil {
+		f.lastKnown = raw
+	}
 	f.knownDirty = err != nil // retried by the worker
 	if err != nil {
 		f.nextKnown = f.now().Add(checkpointRetry)
@@ -582,11 +588,32 @@ func (f *shardConfFollower) saveNeeded() {
 }
 
 // setNeeded records the configuration hash of each shard the latest staged view committed to (replacing the previous view's) and persists it.
-func (f *shardConfFollower) setNeeded(view map[string][]byte) {
+// rootRound is the root round of the accepted certificate the view belongs to: a view that is not newer than the one recorded (a delayed
+// replay, a duplicate) changes nothing and costs nothing.
+func (f *shardConfFollower) setNeeded(view map[string][]byte, rootRound uint64) {
 	f.mu.Lock()
-	f.needed = view
+	if rootRound <= f.neededRound || sameNeeds(f.needed, view) {
+		if rootRound > f.neededRound {
+			f.neededRound = rootRound
+		}
+		f.mu.Unlock()
+		return
+	}
+	f.needed, f.neededRound = view, rootRound
 	f.mu.Unlock()
 	f.saveNeeded()
+}
+
+func sameNeeds(a, b map[string][]byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if !bytes.Equal(v, b[k]) {
+			return false
+		}
+	}
+	return true
 }
 
 // restoreKnown reads the persisted configurations back.
