@@ -521,7 +521,7 @@ func TestASplitShardAndItsSiblingsFollowAKind6Boundary(t *testing.T) {
 	// resolved and validate the same split view; without it the view is dropped
 	cp := filepath.Join(t.TempDir(), "checkpoint.json")
 	f.checkpoint = cp
-	f.saveKnown()
+	f.saveNeeded()
 	c3, _ := newProofClient(t, rm, before)
 	topo3 := c3.proofTopology.(*proofmaterial.StaticTopology)
 	topo3.SetFollowing(map[string]bool{ours.Key(): true, sibling.Key(): true})
@@ -634,7 +634,9 @@ func TestAResponseWithADifferentSidecarIsDifferentWork(t *testing.T) {
 	require.Equal(t, []byte{1, 2, 3}, a.PartitionView, "the original is not modified")
 }
 
-func TestThePersistedConfigurationsKeepWhatViewsNeedFirstAndAreDeterministic(t *testing.T) {
+// Retention by need: the persisted set is the published configuration and the configurations the LATEST staged view needed, replaced as
+// views advance; history never accumulates and never crowds out what the current view needs.
+func TestThePersistedConfigurationsAreExactlyWhatTheLatestViewNeeds(t *testing.T) {
 	f := newFollowFixture(t)
 	fl := f.c.follow
 	fl.checkpoint = filepath.Join(t.TempDir(), "checkpoint.json")
@@ -643,29 +645,36 @@ func TestThePersistedConfigurationsKeepWhatViewsNeedFirstAndAreDeterministic(t *
 		return &types.PartitionDescriptionRecord{Version: 1, NetworkID: 5, PartitionID: utbtest.Partition, PartitionTypeID: 7, TypeIDLen: 8, UnitIDLen: 256,
 			ShardID: shard, T2Timeout: time.Second, Epoch: epoch, EpochStart: epoch + 1}
 	}
-	old := mk(right, 0) // the sibling configuration a staged view needs: the OLDEST of 1100 entries
-	oldHash := confHashOf(t, old)
+	slow := mk(right, 3) // a slow sibling, still what the current view needs
+	slowHash := confHashOf(t, slow)
 	fl.mu.Lock()
-	fl.add(right, oldHash, old)
-	for e := uint64(1); e <= 1100; e++ {
+	fl.add(right, slowHash, slow)
+	hashes := map[uint64][]byte{}
+	for e := uint64(1); e <= 1500; e++ { // a long history of the other shard, each once needed by an earlier view
 		p := mk(left, e)
-		fl.add(left, confHashOf(t, p), p)
+		hashes[e] = confHashOf(t, p)
+		fl.add(left, hashes[e], p)
 	}
 	fl.mu.Unlock()
-	fl.retain(right, oldHash)
-	read := func() []byte {
-		raw, err := os.ReadFile(fl.checkpoint + ".known")
-		require.NoError(t, err)
-		return raw
+	for e := uint64(1); e <= 1500; e += 100 {
+		fl.setNeeded(map[string][]byte{left.Key(): hashes[e], right.Key(): slowHash})
 	}
-	first := read()
+	fl.setNeeded(map[string][]byte{left.Key(): hashes[1500], right.Key(): slowHash})
+	raw, err := os.ReadFile(fl.checkpoint + ".known")
+	require.NoError(t, err)
 	var saved []*types.PartitionDescriptionRecord
-	require.NoError(t, json.Unmarshal(first, &saved))
-	require.Len(t, saved, maxKnownSaved)
-	require.True(t, saved[0].ShardID.Equal(right) && saved[0].Epoch == 0, "what a staged view needs is first")
-	require.EqualValues(t, 1100, saved[1].Epoch, "then the newest")
-	fl.saveKnown()
-	require.Equal(t, first, read(), "deterministic")
+	require.NoError(t, json.Unmarshal(raw, &saved))
+	require.Len(t, saved, 3, "the published configuration and the latest view's two: no history")
+	epochs := map[string]uint64{}
+	for _, p := range saved {
+		epochs[p.ShardID.Key()] = p.Epoch
+	}
+	require.EqualValues(t, 1500, epochs[left.Key()])
+	require.EqualValues(t, 3, epochs[right.Key()], "the slow sibling the current view needs is kept")
+	first := raw
+	fl.saveNeeded()
+	again, _ := os.ReadFile(fl.checkpoint + ".known")
+	require.Equal(t, first, again, "deterministic")
 }
 
 func TestAFailedKnownFileSaveIsRetried(t *testing.T) {
@@ -677,7 +686,7 @@ func TestAFailedKnownFileSaveIsRetried(t *testing.T) {
 	fl.checkpoint = filepath.Join(blocker, "sub", "checkpoint.json")
 	now := time.Unix(1000, 0)
 	fl.now = func() time.Time { return now }
-	fl.saveKnown()
+	fl.saveNeeded()
 	require.True(t, fl.knownDirty)
 	require.NoError(t, os.Remove(blocker))
 	now = now.Add(checkpointRetry + time.Second)
@@ -685,4 +694,78 @@ func TestAFailedKnownFileSaveIsRetried(t *testing.T) {
 	require.False(t, fl.knownDirty)
 	_, err := os.Stat(fl.checkpoint + ".known")
 	require.NoError(t, err)
+}
+
+// The budget is charged until a response is actually handed to the loop: a handback that fails leaves it queued in place and charged, so new
+// admissions are refused rather than finding free slots, and order is kept.
+func TestAResponseStaysChargedUntilItIsHandedBack(t *testing.T) {
+	f := newFollowFixture(t)
+	fl := f.c.follow
+	left, _ := types.ShardID{}.Split()
+	var queued []*int
+	for lookup := 0; len(queued) < maxConfBacklog; lookup++ {
+		for w := 0; w < maxConfWaiters && len(queued) < maxConfBacklog; w++ {
+			x := new(int)
+			*x = len(queued)
+			queued = append(queued, x)
+			require.Equal(t, confQueued, fl.request(left, []byte{byte(lookup), 9}, nil, x))
+		}
+	}
+	// every lookup resolves; the loop takes nothing
+	var delivered []any
+	taking := false
+	fl.deliver = func(m any) bool {
+		if taking {
+			delivered = append(delivered, m)
+		}
+		return taking
+	}
+	fl.mu.Lock()
+	for _, l := range fl.pending {
+		l.next = time.Time{}
+	}
+	fl.mu.Unlock()
+	for lookup := 0; lookup < maxConfBacklog/maxConfWaiters; lookup++ {
+		fl.complete(&lookup2{shard: left, sealed: []byte{byte(lookup), 9}}, []byte{byte(lookup), 9}, &types.PartitionDescriptionRecord{})
+	}
+	require.Len(t, fl.ready, maxConfBacklog, "all queued, none handed back")
+	require.Equal(t, confRefused, fl.request(left, []byte("new lookup"), nil, new(int)), "the detached slots do not look free")
+	// the loop takes them again: in order, each removed only when taken
+	taking = true
+	fl.flush()
+	require.Empty(t, fl.ready)
+	require.Len(t, delivered, maxConfBacklog)
+	for i, m := range delivered {
+		require.Same(t, queued[i], m, "order is kept")
+	}
+	require.Equal(t, confQueued, fl.request(left, []byte("new lookup"), nil, new(int)), "charged slots are released on delivery")
+}
+
+type lookup2 = lookup
+
+// An expired lookup and the fresh lookup registered under its key afterwards are separate: the old fetch completing hands back the
+// registered one's responses exactly once, and the expired one's were handed back when it expired.
+func TestExpiryAndAReplacementLookupDoNotLoseWaiters(t *testing.T) {
+	f := newFollowFixture(t)
+	fl := f.c.follow
+	now := time.Unix(1000, 0)
+	fl.now = func() time.Time { return now }
+	left, _ := types.ShardID{}.Split()
+	sealed := []byte("sealed")
+	w1, w2 := new(int), new(int)
+	require.Equal(t, confQueued, fl.request(left, sealed, []uint64{1}, w1))
+	key := left.Key() + "/" + string(sealed)
+	old := fl.pending[key]
+	var got []any
+	fl.deliver = func(m any) bool { got = append(got, m); return true }
+	// the old lookup is in flight (a fetch holds it) when it expires and intake registers a fresh one under the same key
+	now = now.Add(confPendingTTL + time.Second)
+	require.Equal(t, confQueued, fl.request(left, sealed, []uint64{1}, w2))
+	require.NotSame(t, old, fl.pending[key], "a fresh lookup")
+	require.Equal(t, []any{w1}, fl.ready, "the expired lookup's response was handed back by expiry, once")
+	// the old fetch now succeeds
+	fl.complete(old, sealed, &types.PartitionDescriptionRecord{})
+	require.Equal(t, []any{w1, w2}, got, "each response exactly once, the replacement's included")
+	require.Empty(t, fl.pending)
+	require.Empty(t, fl.ready)
 }

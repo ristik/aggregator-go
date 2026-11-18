@@ -1215,8 +1215,9 @@ func (c *BFTClientImpl) publishConf(uc *types.UnicityCertificate) {
 	}
 }
 
-// retainViewConfigs marks the resolved configurations a staged view needed, so the persisted cache keeps them first.
-func (c *BFTClientImpl) retainViewConfigs(cr *certification.CertificationResponse) {
+// noteViewConfigs records which configurations the latest staged view needed (one per shard, replacing the previous view's), so the
+// persisted set holds exactly what a restart needs to validate it again.
+func (c *BFTClientImpl) noteViewConfigs(cr *certification.CertificationResponse) {
 	topo, static := c.proofTopology.(*proofmaterial.StaticTopology)
 	if !static || c.follow == nil {
 		return
@@ -1225,10 +1226,14 @@ func (c *BFTClientImpl) retainViewConfigs(cr *certification.CertificationRespons
 	if err != nil {
 		return
 	}
+	needed := map[string][]byte{}
 	for _, leaf := range view.Leaves {
 		if pin, ok := topo.Pin(leaf.ShardID); ok && topo.Following(leaf.ShardID) && !bytes.Equal(pin, leaf.ShardConfHash) {
-			c.follow.retain(leaf.ShardID, leaf.ShardConfHash)
+			needed[leaf.ShardID.Key()] = bytes.Clone(leaf.ShardConfHash)
 		}
+	}
+	if len(needed) > 0 {
+		c.follow.setNeeded(needed)
 	}
 }
 
@@ -1236,19 +1241,19 @@ func (c *BFTClientImpl) retainViewConfigs(cr *certification.CertificationRespons
 // marked as following and differs from the seal-authenticated hash the leaf commits to, which this client has not resolved yet. Its lookup is
 // queued with the response registered, so the sidecar is handed back for another attempt once the configuration is known (the topology
 // itself applies the same rule, in live intake and in the stored views the publisher revalidates).
-func (c *BFTClientImpl) deferViewForConfigs(cr *certification.CertificationResponse, op *authOp) bool {
+func (c *BFTClientImpl) deferViewForConfigs(cr *certification.CertificationResponse, op *authOp) (deferred, refused bool) {
 	topo, static := c.proofTopology.(*proofmaterial.StaticTopology)
 	if !static || c.follow == nil {
-		return false
+		return false, false
 	}
 	if _, _, err := proofmaterial.ValidateView(cr.PartitionView, &cr.UC, op.sealVerifier(), nil); err != nil {
-		return false // the ordinary validation reports why
+		return false, false // the ordinary validation reports why
 	}
 	view, err := types.DecodePartitionViewV1(cr.PartitionView)
 	if err != nil {
-		return false
+		return false, false
 	}
-	pending := false
+	pending, refusedAny := false, false
 	for _, leaf := range view.Leaves {
 		pin, ok := topo.Pin(leaf.ShardID)
 		if !ok || !topo.Following(leaf.ShardID) || bytes.Equal(pin, leaf.ShardConfHash) || c.follow.isKnown(leaf.ShardID, leaf.ShardConfHash) {
@@ -1261,13 +1266,12 @@ func (c *BFTClientImpl) deferViewForConfigs(cr *certification.CertificationRespo
 		switch c.follow.request(leaf.ShardID, leaf.ShardConfHash, hints, cr) {
 		case confRefused:
 			c.logger.Warn("A partition view could not be deferred for a sibling shard configuration: lookups are at capacity", "shard", leaf.ShardID.String())
-			metrics.BFTPartitionViewTotal.WithLabelValues("config_refused").Inc()
-			pending = true
+			refusedAny = true
 		case confQueued:
 			pending = true
 		}
 	}
-	return pending
+	return pending, refusedAny
 }
 
 // ProofTopology returns the optional independently pinned topology (nil: none configured).
@@ -1316,8 +1320,13 @@ func (c *BFTClientImpl) stagePartitionViewOp(ctx context.Context, op *authOp, cr
 		metrics.BFTPartitionViewTotal.WithLabelValues("unsharded_skipped").Inc()
 		return
 	}
-	if c.deferViewForConfigs(cr, op) {
-		metrics.BFTPartitionViewTotal.WithLabelValues("config_pending").Inc()
+	if deferred, refused := c.deferViewForConfigs(cr, op); deferred || refused {
+		// a view that no lookup retained is refused, not pending
+		label := "config_pending"
+		if refused {
+			label = "config_refused"
+		}
+		metrics.BFTPartitionViewTotal.WithLabelValues(label).Inc()
 		return
 	}
 	result, view, err := proofmaterial.ValidateView(cr.PartitionView, &cr.UC, op.sealVerifier(), c.proofTopology)
@@ -1332,7 +1341,7 @@ func (c *BFTClientImpl) stagePartitionViewOp(ctx context.Context, op *authOp, cr
 		return
 	}
 	c.proofStaging.Put(digest, view)
-	c.retainViewConfigs(cr)
+	c.noteViewConfigs(cr)
 }
 
 func truncate(s string, n int) string {
