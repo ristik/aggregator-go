@@ -9,10 +9,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
+	"github.com/unicitynetwork/bft-core/network/protocol/certification"
 	"github.com/unicitynetwork/bft-go-base/types"
+
+	"github.com/unicitynetwork/aggregator-go/internal/proofmaterial"
 )
 
 // Following the shard's configuration across a live change (validator-registry kinds 6 ReplaceAggregatorValidators and 8 UpdatePartition).
@@ -51,8 +55,8 @@ const (
 	confBackoffMax   = time.Minute
 	maxPendingConfs  = 64
 	maxConfHints     = 4
-	maxConfWaiters   = 4                // deferred responses kept per pending resolution (the newest)
-	maxReadyConfs    = 64               // resolved responses waiting to be handed back to the message loop
+	maxConfWaiters   = 16               // distinct deferred responses kept per pending resolution; beyond it a new one is refused (backpressure), none is dropped
+	maxKnownSaved    = 1024             // configurations persisted beside the checkpoint
 	confPendingTTL   = 10 * time.Minute // a resolution unresolved for this long is obsolete (the shard moved on or the hash is not a configuration) and is reclaimed
 	checkpointRetry  = 30 * time.Second // between attempts to persist a checkpoint that failed to save
 )
@@ -88,6 +92,7 @@ type shardConfFollower struct {
 	checkpoint string
 	unsaved    *checkpointJob
 	nextSave   time.Time
+	saveMu     sync.Mutex // serializes the writers of the checkpoint and the known-configuration file
 }
 
 type checkpointJob struct {
@@ -147,10 +152,21 @@ func (f *shardConfFollower) request(shard types.ShardID, sealed []byte, hints []
 		}
 	}
 	if waiter != nil {
-		if len(p.waiters) >= maxConfWaiters {
-			p.waiters = p.waiters[1:]
+		key := waiterKey(waiter)
+		replaced := false
+		for i, w := range p.waiters {
+			if waiterKey(w) == key { // the same certificate delivered again (another root, a repeat): it satisfies the same work
+				p.waiters[i], replaced = waiter, true
+				break
+			}
 		}
-		p.waiters = append(p.waiters, waiter)
+		if !replaced {
+			if len(p.waiters) >= maxConfWaiters {
+				f.mu.Unlock()
+				return false // backpressure: nothing already registered is dropped; this delivery is refused and the root sends it again
+			}
+			p.waiters = append(p.waiters, waiter)
+		}
 	}
 	due := !p.next.After(now)
 	f.mu.Unlock()
@@ -195,6 +211,17 @@ func (f *shardConfFollower) expireLocked(now time.Time) {
 	}
 }
 
+// waiterKey identifies the work a deferred response stands for: its certificate and whether it carries a view. Two responses with the same key
+// can supply the same certificate and sidecar, so one replaces the other.
+func waiterKey(w any) string {
+	if cr, ok := w.(*certification.CertificationResponse); ok && cr != nil {
+		if d, _, err := proofmaterial.DigestOfUC(&cr.UC); err == nil {
+			return fmt.Sprintf("%x/%d", d, len(cr.PartitionView))
+		}
+	}
+	return fmt.Sprintf("%p", w)
+}
+
 func containsEpoch(s []uint64, v uint64) bool {
 	for _, x := range s {
 		if x == v {
@@ -231,6 +258,13 @@ func (f *shardConfFollower) process(ctx context.Context) {
 			due = append(due, p)
 		}
 	}
+	// the local shard's current progress is served first, then the oldest
+	sort.Slice(due, func(i, j int) bool {
+		if due[i].local != due[j].local {
+			return due[i].local
+		}
+		return due[i].born.Before(due[j].born)
+	})
 	f.mu.Unlock()
 	for _, p := range due {
 		if ctx.Err() != nil {
@@ -269,12 +303,10 @@ func (f *shardConfFollower) resolve(ctx context.Context, p *pendingConf) {
 		f.mu.Lock()
 		f.add(p.shard, h, pdr)
 		delete(f.pending, p.shard.Key()+"/"+string(p.sealed))
-		f.ready = append(f.ready, p.waiters...)
-		if over := len(f.ready) - maxReadyConfs; over > 0 {
-			f.ready = f.ready[over:]
-		}
+		f.ready = append(f.ready, p.waiters...) // bounded by the registered waiters (maxPendingConfs x maxConfWaiters): never evicted
 		p.waiters = nil
 		f.mu.Unlock()
+		f.saveKnown()
 		f.flush()
 		return
 	}
@@ -303,7 +335,7 @@ func (f *shardConfFollower) publish(uc *types.UnicityCertificate) (*types.Partit
 	f.mu.Unlock()
 	var err error
 	if path != "" {
-		if err = saveConfCheckpoint(path, pdr, uc); err != nil {
+		if err = f.writeCheckpoint(&checkpointJob{pdr: pdr, uc: uc}); err != nil {
 			f.mu.Lock()
 			f.unsaved, f.nextSave = &checkpointJob{pdr: pdr, uc: uc}, f.now().Add(checkpointRetry) // retried by the worker
 			f.mu.Unlock()
@@ -335,11 +367,22 @@ func (f *shardConfFollower) flush() {
 	if len(kept) > 0 {
 		f.mu.Lock()
 		f.ready = append(kept, f.ready...)
-		if over := len(f.ready) - maxReadyConfs; over > 0 {
-			f.ready = f.ready[over:]
-		}
 		f.mu.Unlock()
 	}
+}
+
+// writeCheckpoint persists a checkpoint. Writers are serialized and a checkpoint older than the published configuration is never written, so
+// a retry of an older epoch cannot replace a newer save.
+func (f *shardConfFollower) writeCheckpoint(job *checkpointJob) error {
+	f.saveMu.Lock()
+	defer f.saveMu.Unlock()
+	f.mu.Lock()
+	stale, path := job.pdr.Epoch < f.latest.Epoch, f.checkpoint
+	f.mu.Unlock()
+	if stale || path == "" {
+		return nil
+	}
+	return saveConfCheckpoint(path, job.pdr, job.uc)
 }
 
 // retrySave persists a checkpoint whose save failed, as soon as the retry interval has passed.
@@ -350,7 +393,7 @@ func (f *shardConfFollower) retrySave() {
 	if job == nil || path == "" || !due {
 		return
 	}
-	err := saveConfCheckpoint(path, job.pdr, job.uc)
+	err := f.writeCheckpoint(job)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err != nil {
@@ -449,4 +492,75 @@ func (f *shardConfFollower) latestHash() []byte {
 		return nil
 	}
 	return h
+}
+
+// The configurations this client resolved are persisted beside the checkpoint (<checkpoint>.known) so a restarted process, and the proof
+// publisher that revalidates stored views with it, can validate a split view whose other shards changed. Each entry is checked against its own
+// hash and the shard identity when read; an entry only widens which seal-authenticated leaf hashes a following pin accepts, and the leaf
+// itself is authenticated by the seal.
+func (f *shardConfFollower) saveKnown() {
+	f.mu.Lock()
+	path := f.checkpoint
+	var all []*types.PartitionDescriptionRecord
+	for _, byHash := range f.known {
+		for _, pdr := range byHash {
+			if len(all) < maxKnownSaved {
+				all = append(all, pdr)
+			}
+		}
+	}
+	f.mu.Unlock()
+	if path == "" {
+		return
+	}
+	f.saveMu.Lock()
+	defer f.saveMu.Unlock()
+	raw, err := json.Marshal(all)
+	if err != nil {
+		return
+	}
+	_ = writeFileAtomic(path+".known", raw) // best effort: a restart resolves again
+}
+
+// restoreKnown reads the persisted configurations back.
+func (f *shardConfFollower) restoreKnown(path string) {
+	raw, err := os.ReadFile(path + ".known") // #nosec G304 -- operator supplied local file
+	if err != nil {
+		return
+	}
+	var all []*types.PartitionDescriptionRecord
+	if json.Unmarshal(raw, &all) != nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, pdr := range all {
+		if pdr == nil || pdr.NetworkID != f.network || pdr.PartitionID != f.partition {
+			continue
+		}
+		h, err := pdr.Hash(crypto.SHA256)
+		if err != nil {
+			continue
+		}
+		f.add(pdr.ShardID, h, pdr)
+	}
+}
+
+func writeFileAtomic(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".shardconf-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }

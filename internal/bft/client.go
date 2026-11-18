@@ -1162,6 +1162,7 @@ func (c *BFTClientImpl) SetShardConfSource(src ShardConfSource) {
 	c.reinject = make(chan any, 16)
 	c.followTopology()
 	if f.checkpoint != "" {
+		f.restoreKnown(f.checkpoint)
 		verify := func(uc *types.UnicityCertificate) error {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()

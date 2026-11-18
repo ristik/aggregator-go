@@ -515,4 +515,81 @@ func TestASplitShardAndItsSiblingsFollowAKind6Boundary(t *testing.T) {
 	f2.process(context.Background())
 	c2.stagePartitionView(t.Context(), cr)
 	require.Zero(t, c2.proofStaging.Len())
+
+	// startup: a fresh follower and topology (a restarted process, whose publisher revalidates the stored view) restore what the first one
+	// resolved and validate the same split view; without it the view is dropped
+	cp := filepath.Join(t.TempDir(), "checkpoint.json")
+	f.checkpoint = cp
+	f.saveKnown()
+	c3, _ := newProofClient(t, rm, before)
+	topo3 := c3.proofTopology.(*proofmaterial.StaticTopology)
+	topo3.SetFollowing(map[string]bool{ours.Key(): true, sibling.Key(): true})
+	f3 := newShardConfFollower(&confServer{byEpoch: map[string]map[uint64]*types.PartitionDescriptionRecord{}}, ours0, startHash)
+	c3.follow = f3
+	c3.followTopology()
+	_, _, err = proofmaterial.ValidateView(cr.PartitionView, &cr.UC, c3.authn.sealVerifier(context.Background()), topo3)
+	require.Error(t, err, "a fresh process knows nothing yet")
+	f3.restoreKnown(cp)
+	_, _, err = proofmaterial.ValidateView(cr.PartitionView, &cr.UC, c3.authn.sealVerifier(context.Background()), topo3)
+	require.NoError(t, err, "restored: the publisher at startup keeps the accepted split view")
+}
+
+func TestRegisteredResponsesAreNeverSilentlyDropped(t *testing.T) {
+	f := newFollowFixture(t)
+	mkResp := func(round uint64, view []byte) *certification.CertificationResponse {
+		uc := utbtest.CertificateWithConf(t, 5, 2, round, f.signers, make([]byte, 32), f.h1)
+		return &certification.CertificationResponse{Partition: utbtest.Partition, UC: *uc, PartitionView: view}
+	}
+	var first []*certification.CertificationResponse
+	for i := 0; i < maxConfWaiters; i++ {
+		cr := mkResp(uint64(100+i), nil)
+		first = append(first, cr)
+		require.ErrorIs(t, f.verifyDeferred(&cr.UC, cr), ErrShardConfPending)
+	}
+	// the same certificate delivered again (another root) replaces its own entry: it supplies the same work
+	again := mkResp(100, nil)
+	require.ErrorIs(t, f.verifyDeferred(&again.UC, again), ErrShardConfPending)
+	// a distinct one beyond the bound is refused, and nothing registered is dropped
+	extra := mkResp(190, nil)
+	require.ErrorIs(t, f.verifyDeferred(&extra.UC, extra), ErrShardConfPending)
+	f.c.reinject = make(chan any, 64)
+	f.resolve()
+	got := map[any]bool{}
+	for len(f.c.reinject) > 0 {
+		got[<-f.c.reinject] = true
+	}
+	require.Len(t, got, maxConfWaiters, "every registered response comes back, the refused one does not")
+	require.True(t, got[again])
+	require.False(t, got[first[0]], "replaced by its own duplicate")
+	for _, cr := range first[1:] {
+		require.True(t, got[cr])
+	}
+	require.False(t, got[extra])
+}
+
+func TestAnOlderCheckpointRetryNeverOverwritesANewerSave(t *testing.T) {
+	f := newFollowFixture(t)
+	first := f.cert(t, f.h1)
+	require.ErrorIs(t, f.verify(first, 1), ErrShardConfPending)
+	f.resolve()
+	second := f.cert(t, f.h2)
+	require.ErrorIs(t, f.verify(second, 2), ErrShardConfPending)
+	f.resolve()
+	f.c.publishConf(first)
+	f.c.publishConf(second)
+	// an older job that was copied before the newer save committed
+	require.NoError(t, f.c.follow.writeCheckpoint(&checkpointJob{pdr: f.pdr1, uc: first}))
+	pdr, _, err := loadConfCheckpoint(f.checkpoint)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, pdr.Epoch, "the newer epoch stays on disk")
+}
+
+func TestTheLocalShardIsServedFirst(t *testing.T) {
+	f := newFollowFixture(t)
+	left, _ := types.ShardID{}.Split()
+	f.srv.byEpoch[left.Key()] = map[uint64]*types.PartitionDescriptionRecord{}
+	f.c.follow.request(left, []byte("older sibling"), []uint64{1}, nil)
+	require.ErrorIs(t, f.verify(f.cert(t, f.h1)), ErrShardConfPending)
+	f.resolve()
+	require.Equal(t, types.ShardID{}.Key()+"@1", f.srv.calls[0], "the local shard's lookup first, whatever the age of the siblings'")
 }
