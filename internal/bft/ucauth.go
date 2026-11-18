@@ -12,7 +12,10 @@ import (
 
 	"github.com/unicitynetwork/aggregator-go/internal/storage/interfaces"
 
+	"github.com/unicitynetwork/bft-core/network/protocol/certification"
 	"github.com/unicitynetwork/bft-go-base/types"
+
+	"github.com/unicitynetwork/aggregator-go/internal/proofmaterial"
 )
 
 // ucAuthenticator is the single boundary where unicity certificates received from
@@ -335,8 +338,12 @@ func (o *authOp) verifyUC(uc *types.UnicityCertificate, partition types.Partitio
 		if ir := uc.InputRecord; ir != nil {
 			hints = append(hints, ir.Epoch+1, ir.Epoch)
 		}
-		if a.follow.request(a.follow.ours, uc.ShardConfHash, hints, o.deferred) {
+		deferred := o.deferredResponse()
+		switch a.follow.request(a.follow.ours, uc.ShardConfHash, hints, deferred) {
+		case confKnown:
 			return nil // resolved in the meantime: the certificate verifies against the configuration it commits to
+		case confRefused:
+			return fmt.Errorf("%w: the certificate commits to configuration %X", ErrShardConfBusy, uc.ShardConfHash)
 		}
 		return fmt.Errorf("%w: the certificate commits to configuration %X", ErrShardConfPending, uc.ShardConfHash)
 	}
@@ -367,6 +374,21 @@ func (o *authOp) verifyUCPinned(uc *types.UnicityCertificate, partition types.Pa
 		return fmt.Errorf("unicity seal hash %X does not match with the root hash of the unicity tree %X", uc.UnicitySeal.Hash, root)
 	}
 	return o.verifySeal(uc.UnicitySeal)
+}
+
+// deferredResponse is the response to register with a lookup: its optional sidecar is validated first (against the seal, pins aside) and left
+// out when it does not validate, so the replay carries only a view that was usable.
+func (o *authOp) deferredResponse() any {
+	cr, ok := o.deferred.(*certification.CertificationResponse)
+	if !ok || cr == nil || len(cr.PartitionView) == 0 {
+		return o.deferred
+	}
+	if _, _, err := proofmaterial.ValidateView(cr.PartitionView, &cr.UC, o.sealVerifier(), nil); err == nil {
+		return cr
+	}
+	plain := *cr
+	plain.PartitionView = nil
+	return &plain
 }
 
 // AdmittedTrustBases is the optional lookup of trust bases already admitted to the local

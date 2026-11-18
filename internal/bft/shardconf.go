@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,6 +57,7 @@ const (
 	maxPendingConfs  = 64
 	maxConfHints     = 4
 	maxConfWaiters   = 16               // distinct deferred responses kept per pending resolution; beyond it a new one is refused (backpressure), none is dropped
+	maxConfBacklog   = 256              // deferred responses held at once, registered and resolved-but-not-yet-handed-back together
 	maxKnownSaved    = 1024             // configurations persisted beside the checkpoint
 	confPendingTTL   = 10 * time.Minute // a resolution unresolved for this long is obsolete (the shard moved on or the hash is not a configuration) and is reclaimed
 	checkpointRetry  = 30 * time.Second // between attempts to persist a checkpoint that failed to save
@@ -92,7 +94,9 @@ type shardConfFollower struct {
 	checkpoint string
 	unsaved    *checkpointJob
 	nextSave   time.Time
-	saveMu     sync.Mutex // serializes the writers of the checkpoint and the known-configuration file
+	retained   map[string]bool // shard key/hash of the configurations staged views needed
+	knownDirty bool            // the known-configuration file failed to save
+	saveMu     sync.Mutex      // serializes the writers of the checkpoint and the known-configuration file
 }
 
 type checkpointJob struct {
@@ -123,15 +127,28 @@ func (f *shardConfFollower) isKnown(shard types.ShardID, hash []byte) bool {
 	return ok
 }
 
+// confResult is the outcome of queueing a lookup.
+type confResult int
+
+const (
+	confQueued  confResult = iota // the lookup is queued and the response (if any) is registered with it
+	confKnown                     // the configuration is known already: nothing to defer
+	confRefused                   // no capacity (pending lookups, waiters of the lookup, or the backlog): nothing was registered
+)
+
+// ErrShardConfBusy reports an authentic certificate (or view) that could not be deferred for lack of capacity: it is refused, not pending,
+// and is reported; the root sends the certificate again (the inactivity recovery asks for it).
+var ErrShardConfBusy = errors.New("shard configuration lookups are at capacity")
+
 // request queues the resolution of the sealed hash of a shard's configuration. hints are the shard epochs it can be (from authenticated
 // records); a request already queued is coalesced and only gains hints. waiter, when not nil, is the deferred response that needs it: it is
 // registered with the lookup before the worker is woken, kept until it is handed back, and delivered once the lookup resolves. It reports
 // whether the configuration is known already (a resolution finished first): the caller then does not defer.
-func (f *shardConfFollower) request(shard types.ShardID, sealed []byte, hints []uint64, waiter any) (known bool) {
+func (f *shardConfFollower) request(shard types.ShardID, sealed []byte, hints []uint64, waiter any) confResult {
 	f.mu.Lock()
 	if _, ok := f.known[shard.Key()][string(sealed)]; ok {
 		f.mu.Unlock()
-		return true
+		return confKnown
 	}
 	key := shard.Key() + "/" + string(sealed)
 	now := f.now()
@@ -141,7 +158,7 @@ func (f *shardConfFollower) request(shard types.ShardID, sealed []byte, hints []
 		local := shard.Equal(f.ours)
 		if len(f.pending) >= maxPendingConfs && !f.reclaimLocked(now, local) {
 			f.mu.Unlock()
-			return false
+			return confRefused
 		}
 		p = &pendingConf{shard: shard, sealed: bytes.Clone(sealed), next: now, born: now, local: local}
 		f.pending[key] = p
@@ -161,9 +178,9 @@ func (f *shardConfFollower) request(shard types.ShardID, sealed []byte, hints []
 			}
 		}
 		if !replaced {
-			if len(p.waiters) >= maxConfWaiters {
+			if len(p.waiters) >= maxConfWaiters || f.backlogLocked() >= maxConfBacklog {
 				f.mu.Unlock()
-				return false // backpressure: nothing already registered is dropped; this delivery is refused and the root sends it again
+				return confRefused // nothing already registered is dropped; this delivery is refused, and the caller reports it
 			}
 			p.waiters = append(p.waiters, waiter)
 		}
@@ -176,7 +193,16 @@ func (f *shardConfFollower) request(shard types.ShardID, sealed []byte, hints []
 		default:
 		}
 	}
-	return false
+	return confQueued
+}
+
+// backlogLocked counts the deferred responses held: registered with a lookup and resolved but not yet handed back.
+func (f *shardConfFollower) backlogLocked() int {
+	n := len(f.ready)
+	for _, p := range f.pending {
+		n += len(p.waiters)
+	}
+	return n
 }
 
 // reclaimLocked makes room for a request: it drops the resolutions that are obsolete (older than confPendingTTL), and, for the local shard's
@@ -192,7 +218,7 @@ func (f *shardConfFollower) reclaimLocked(now time.Time, local bool) bool {
 	var oldest string
 	var at time.Time
 	for k, p := range f.pending {
-		if !p.local && (oldest == "" || p.born.Before(at)) {
+		if !p.local && len(p.waiters) == 0 && (oldest == "" || p.born.Before(at)) { // a lookup that holds a response is never evicted
 			oldest, at = k, p.born
 		}
 	}
@@ -206,17 +232,21 @@ func (f *shardConfFollower) reclaimLocked(now time.Time, local bool) bool {
 func (f *shardConfFollower) expireLocked(now time.Time) {
 	for k, p := range f.pending {
 		if now.Sub(p.born) > confPendingTTL {
+			f.ready = append(f.ready, p.waiters...) // handed back: the message loop verifies it again and queues a fresh lookup if still needed
 			delete(f.pending, k)
 		}
 	}
 }
 
-// waiterKey identifies the work a deferred response stands for: its certificate and whether it carries a view. Two responses with the same key
-// can supply the same certificate and sidecar, so one replaces the other.
+// waiterKey identifies the work a deferred response stands for: the whole response, certificate and sidecar bytes. Two responses with the same
+// key supply the same certificate and the same view, so one replaces the other; anything that differs is separate work.
 func waiterKey(w any) string {
 	if cr, ok := w.(*certification.CertificationResponse); ok && cr != nil {
 		if d, _, err := proofmaterial.DigestOfUC(&cr.UC); err == nil {
-			return fmt.Sprintf("%x/%d", d, len(cr.PartitionView))
+			h := sha256.New()
+			h.Write(d[:])
+			h.Write(cr.PartitionView)
+			return fmt.Sprintf("%x", h.Sum(nil))
 		}
 	}
 	return fmt.Sprintf("%p", w)
@@ -388,6 +418,12 @@ func (f *shardConfFollower) writeCheckpoint(job *checkpointJob) error {
 // retrySave persists a checkpoint whose save failed, as soon as the retry interval has passed.
 func (f *shardConfFollower) retrySave() {
 	f.mu.Lock()
+	dirty, dueKnown := f.knownDirty, !f.now().Before(f.nextSave)
+	f.mu.Unlock()
+	if dirty && dueKnown {
+		f.saveKnown()
+	}
+	f.mu.Lock()
 	job, path, due := f.unsaved, f.checkpoint, !f.now().Before(f.nextSave)
 	f.mu.Unlock()
 	if job == nil || path == "" || !due {
@@ -501,25 +537,83 @@ func (f *shardConfFollower) latestHash() []byte {
 func (f *shardConfFollower) saveKnown() {
 	f.mu.Lock()
 	path := f.checkpoint
-	var all []*types.PartitionDescriptionRecord
-	for _, byHash := range f.known {
+	type entry struct {
+		shard types.ShardID
+		hash  string
+		pdr   *types.PartitionDescriptionRecord
+		rank  int // 0: retained by a staged view, 1: the newest of its shard, 2: the rest
+	}
+	var all []entry
+	for k, byHash := range f.known {
+		var newest uint64
 		for _, pdr := range byHash {
-			if len(all) < maxKnownSaved {
-				all = append(all, pdr)
+			if pdr.Epoch > newest {
+				newest = pdr.Epoch
 			}
+		}
+		for h, pdr := range byHash {
+			rank := 2
+			if pdr.Epoch == newest {
+				rank = 1
+			}
+			if f.retained[k+"/"+h] {
+				rank = 0
+			}
+			all = append(all, entry{pdr.ShardID, h, pdr, rank})
 		}
 	}
 	f.mu.Unlock()
 	if path == "" {
 		return
 	}
+	// deterministic: what the staged views and the current topology need first, then the newest epochs
+	sort.Slice(all, func(i, j int) bool {
+		a, b := all[i], all[j]
+		if a.rank != b.rank {
+			return a.rank < b.rank
+		}
+		if a.pdr.Epoch != b.pdr.Epoch {
+			return a.pdr.Epoch > b.pdr.Epoch
+		}
+		if ka, kb := a.shard.Key(), b.shard.Key(); ka != kb {
+			return ka < kb
+		}
+		return a.hash < b.hash
+	})
+	if len(all) > maxKnownSaved {
+		all = all[:maxKnownSaved]
+	}
+	out := make([]*types.PartitionDescriptionRecord, len(all))
+	for i, e := range all {
+		out[i] = e.pdr
+	}
 	f.saveMu.Lock()
 	defer f.saveMu.Unlock()
-	raw, err := json.Marshal(all)
-	if err != nil {
-		return
+	raw, err := json.Marshal(out)
+	if err == nil {
+		err = writeFileAtomic(path+".known", raw)
 	}
-	_ = writeFileAtomic(path+".known", raw) // best effort: a restart resolves again
+	f.mu.Lock()
+	f.knownDirty = err != nil // retried by the worker
+	if err != nil {
+		f.nextSave = f.now().Add(checkpointRetry)
+	}
+	f.mu.Unlock()
+}
+
+// retain marks a configuration a staged view needed: it is persisted first, whatever else the bound would drop.
+func (f *shardConfFollower) retain(shard types.ShardID, hash []byte) {
+	f.mu.Lock()
+	k := shard.Key() + "/" + string(hash)
+	changed := !f.retained[k]
+	if f.retained == nil {
+		f.retained = map[string]bool{}
+	}
+	f.retained[k] = true
+	f.mu.Unlock()
+	if changed {
+		f.saveKnown()
+	}
 }
 
 // restoreKnown reads the persisted configurations back.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -551,7 +552,9 @@ func TestRegisteredResponsesAreNeverSilentlyDropped(t *testing.T) {
 	require.ErrorIs(t, f.verifyDeferred(&again.UC, again), ErrShardConfPending)
 	// a distinct one beyond the bound is refused, and nothing registered is dropped
 	extra := mkResp(190, nil)
-	require.ErrorIs(t, f.verifyDeferred(&extra.UC, extra), ErrShardConfPending)
+	err := f.verifyDeferred(&extra.UC, extra)
+	require.ErrorIs(t, err, ErrShardConfBusy, "a refused response is reported as such, not as pending")
+	require.NotErrorIs(t, err, ErrShardConfPending)
 	f.c.reinject = make(chan any, 64)
 	f.resolve()
 	got := map[any]bool{}
@@ -592,4 +595,94 @@ func TestTheLocalShardIsServedFirst(t *testing.T) {
 	require.ErrorIs(t, f.verify(f.cert(t, f.h1)), ErrShardConfPending)
 	f.resolve()
 	require.Equal(t, types.ShardID{}.Key()+"@1", f.srv.calls[0], "the local shard's lookup first, whatever the age of the siblings'")
+}
+
+func TestTheBacklogCountsRegisteredAndResolvedResponsesTogether(t *testing.T) {
+	f := newFollowFixture(t)
+	fl := f.c.follow
+	left, _ := types.ShardID{}.Split()
+	n := 0
+	for lookup := 0; n < maxConfBacklog; lookup++ {
+		for w := 0; w < maxConfWaiters && n < maxConfBacklog; w++ {
+			require.Equal(t, confQueued, fl.request(left, []byte{byte(lookup), 7}, nil, new(int)))
+			n++
+		}
+	}
+	require.Equal(t, confRefused, fl.request(left, []byte("another lookup"), nil, new(int)), "the backlog is full")
+	// resolving releases the pending slots but the responses are still held until handed back: the bound still holds
+	fl.mu.Lock()
+	for k, p := range fl.pending {
+		fl.ready = append(fl.ready, p.waiters...)
+		delete(fl.pending, k)
+	}
+	fl.mu.Unlock()
+	require.Equal(t, confRefused, fl.request(left, []byte("yet another"), nil, new(int)), "undelivered resolved responses count against the backlog")
+}
+
+func TestAResponseWithADifferentSidecarIsDifferentWork(t *testing.T) {
+	f := newFollowFixture(t)
+	uc := f.cert(t, f.h1)
+	a := &certification.CertificationResponse{Partition: utbtest.Partition, UC: *uc, PartitionView: []byte{1, 2, 3}}
+	b := &certification.CertificationResponse{Partition: utbtest.Partition, UC: *uc, PartitionView: []byte{1, 2, 4}}
+	require.NotEqual(t, waiterKey(a), waiterKey(b), "equal length, different bytes")
+	require.Equal(t, waiterKey(a), waiterKey(&certification.CertificationResponse{Partition: utbtest.Partition, UC: *uc, PartitionView: []byte{1, 2, 3}}))
+	// an invalid optional sidecar is validated before registering and left out of the replay
+	op := f.c.authn.beginIntake(context.Background())
+	op.deferred = a
+	got := op.deferredResponse().(*certification.CertificationResponse)
+	require.Nil(t, got.PartitionView, "a sidecar that does not validate is not registered")
+	require.Equal(t, []byte{1, 2, 3}, a.PartitionView, "the original is not modified")
+}
+
+func TestThePersistedConfigurationsKeepWhatViewsNeedFirstAndAreDeterministic(t *testing.T) {
+	f := newFollowFixture(t)
+	fl := f.c.follow
+	fl.checkpoint = filepath.Join(t.TempDir(), "checkpoint.json")
+	left, right := types.ShardID{}.Split()
+	mk := func(shard types.ShardID, epoch uint64) *types.PartitionDescriptionRecord {
+		return &types.PartitionDescriptionRecord{Version: 1, NetworkID: 5, PartitionID: utbtest.Partition, PartitionTypeID: 7, TypeIDLen: 8, UnitIDLen: 256,
+			ShardID: shard, T2Timeout: time.Second, Epoch: epoch, EpochStart: epoch + 1}
+	}
+	old := mk(right, 0) // the sibling configuration a staged view needs: the OLDEST of 1100 entries
+	oldHash := confHashOf(t, old)
+	fl.mu.Lock()
+	fl.add(right, oldHash, old)
+	for e := uint64(1); e <= 1100; e++ {
+		p := mk(left, e)
+		fl.add(left, confHashOf(t, p), p)
+	}
+	fl.mu.Unlock()
+	fl.retain(right, oldHash)
+	read := func() []byte {
+		raw, err := os.ReadFile(fl.checkpoint + ".known")
+		require.NoError(t, err)
+		return raw
+	}
+	first := read()
+	var saved []*types.PartitionDescriptionRecord
+	require.NoError(t, json.Unmarshal(first, &saved))
+	require.Len(t, saved, maxKnownSaved)
+	require.True(t, saved[0].ShardID.Equal(right) && saved[0].Epoch == 0, "what a staged view needs is first")
+	require.EqualValues(t, 1100, saved[1].Epoch, "then the newest")
+	fl.saveKnown()
+	require.Equal(t, first, read(), "deterministic")
+}
+
+func TestAFailedKnownFileSaveIsRetried(t *testing.T) {
+	f := newFollowFixture(t)
+	fl := f.c.follow
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "blocker")
+	require.NoError(t, os.WriteFile(blocker, []byte("x"), 0o600))
+	fl.checkpoint = filepath.Join(blocker, "sub", "checkpoint.json")
+	now := time.Unix(1000, 0)
+	fl.now = func() time.Time { return now }
+	fl.saveKnown()
+	require.True(t, fl.knownDirty)
+	require.NoError(t, os.Remove(blocker))
+	now = now.Add(checkpointRetry + time.Second)
+	fl.retrySave()
+	require.False(t, fl.knownDirty)
+	_, err := os.Stat(fl.checkpoint + ".known")
+	require.NoError(t, err)
 }

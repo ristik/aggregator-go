@@ -616,6 +616,10 @@ func (c *BFTClientImpl) logResponseError(ctx context.Context, kind string, err e
 		c.logger.WithContext(ctx).Debug("ignoring a stale unicity certificate (a root that lags)", "message", kind, "reason", err.Error())
 		return
 	}
+	if errors.Is(err, ErrShardConfBusy) {
+		c.logger.WithContext(ctx).Warn("certificate refused: shard configuration lookups are at capacity; the root sends it again", "message", kind, "reason", err.Error())
+		return
+	}
 	if errors.Is(err, ErrShardConfPending) {
 		c.logger.WithContext(ctx).Info("certificate deferred until its shard configuration is resolved", "message", kind, "reason", err.Error())
 		return
@@ -1211,6 +1215,23 @@ func (c *BFTClientImpl) publishConf(uc *types.UnicityCertificate) {
 	}
 }
 
+// retainViewConfigs marks the resolved configurations a staged view needed, so the persisted cache keeps them first.
+func (c *BFTClientImpl) retainViewConfigs(cr *certification.CertificationResponse) {
+	topo, static := c.proofTopology.(*proofmaterial.StaticTopology)
+	if !static || c.follow == nil {
+		return
+	}
+	view, err := types.DecodePartitionViewV1(cr.PartitionView)
+	if err != nil {
+		return
+	}
+	for _, leaf := range view.Leaves {
+		if pin, ok := topo.Pin(leaf.ShardID); ok && topo.Following(leaf.ShardID) && !bytes.Equal(pin, leaf.ShardConfHash) {
+			c.follow.retain(leaf.ShardID, leaf.ShardConfHash)
+		}
+	}
+}
+
 // deferViewForConfigs reports whether the view of a response must wait for configurations to be resolved: a leaf of a shard whose pin is
 // marked as following and differs from the seal-authenticated hash the leaf commits to, which this client has not resolved yet. Its lookup is
 // queued with the response registered, so the sidecar is handed back for another attempt once the configuration is known (the topology
@@ -1237,7 +1258,12 @@ func (c *BFTClientImpl) deferViewForConfigs(cr *certification.CertificationRespo
 		if leaf.InputRecord != nil {
 			hints = []uint64{leaf.InputRecord.Epoch + 1, leaf.InputRecord.Epoch}
 		}
-		if !c.follow.request(leaf.ShardID, leaf.ShardConfHash, hints, cr) {
+		switch c.follow.request(leaf.ShardID, leaf.ShardConfHash, hints, cr) {
+		case confRefused:
+			c.logger.Warn("A partition view could not be deferred for a sibling shard configuration: lookups are at capacity", "shard", leaf.ShardID.String())
+			metrics.BFTPartitionViewTotal.WithLabelValues("config_refused").Inc()
+			pending = true
+		case confQueued:
 			pending = true
 		}
 	}
@@ -1306,6 +1332,7 @@ func (c *BFTClientImpl) stagePartitionViewOp(ctx context.Context, op *authOp, cr
 		return
 	}
 	c.proofStaging.Put(digest, view)
+	c.retainViewConfigs(cr)
 }
 
 func truncate(s string, n int) string {
