@@ -98,7 +98,8 @@ type shardConfFollower struct {
 	// checkpoint is the file the published configuration is persisted in ("" none); unsaved is the checkpoint whose save failed, retried
 	checkpoint string
 	unsaved    *checkpointJob
-	nextSave   time.Time
+	nextSave   time.Time  // the next attempt at the checkpoint
+	nextKnown  time.Time  // the next attempt at the needed-configurations file: its own schedule, never delaying the checkpoint
 	knownDirty bool       // the needed-configurations file failed to save
 	saveMu     sync.Mutex // serializes the writers of the checkpoint and the needed-configurations file
 }
@@ -424,27 +425,27 @@ func (f *shardConfFollower) writeCheckpoint(job *checkpointJob) error {
 	return saveConfCheckpoint(path, job.pdr, job.uc)
 }
 
-// retrySave persists a checkpoint whose save failed, as soon as the retry interval has passed.
+// retrySave retries what failed to save, the live checkpoint first; each file has its own retry schedule, so a failing cache file never
+// delays the checkpoint.
 func (f *shardConfFollower) retrySave() {
-	f.mu.Lock()
-	dirty, dueKnown := f.knownDirty, !f.now().Before(f.nextSave)
-	f.mu.Unlock()
-	if dirty && dueKnown {
-		f.saveNeeded()
-	}
 	f.mu.Lock()
 	job, path, due := f.unsaved, f.checkpoint, !f.now().Before(f.nextSave)
 	f.mu.Unlock()
-	if job == nil || path == "" || !due {
-		return
+	if job != nil && path != "" && due {
+		err := f.writeCheckpoint(job)
+		f.mu.Lock()
+		if err != nil {
+			f.nextSave = f.now().Add(checkpointRetry)
+		} else if f.unsaved == job { // not replaced by a newer configuration meanwhile
+			f.unsaved = nil
+		}
+		f.mu.Unlock()
 	}
-	err := f.writeCheckpoint(job)
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if err != nil {
-		f.nextSave = f.now().Add(checkpointRetry)
-	} else if f.unsaved == job { // not replaced by a newer configuration meanwhile
-		f.unsaved = nil
+	dirty, dueKnown := f.knownDirty, !f.now().Before(f.nextKnown)
+	f.mu.Unlock()
+	if dirty && dueKnown {
+		f.saveNeeded()
 	}
 }
 
@@ -575,7 +576,7 @@ func (f *shardConfFollower) saveNeeded() {
 	f.mu.Lock()
 	f.knownDirty = err != nil // retried by the worker
 	if err != nil {
-		f.nextSave = f.now().Add(checkpointRetry)
+		f.nextKnown = f.now().Add(checkpointRetry)
 	}
 	f.mu.Unlock()
 }

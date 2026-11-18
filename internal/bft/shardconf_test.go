@@ -769,3 +769,70 @@ func TestExpiryAndAReplacementLookupDoNotLoseWaiters(t *testing.T) {
 	require.Empty(t, fl.pending)
 	require.Empty(t, fl.ready)
 }
+
+// Each file has its own retry schedule: a cache file that keeps failing never delays the live checkpoint.
+func TestAFailingKnownFileDoesNotDelayTheCheckpointRetry(t *testing.T) {
+	f := newFollowFixture(t)
+	fl := f.c.follow
+	dir := t.TempDir()
+	fl.checkpoint = filepath.Join(dir, "checkpoint.json")
+	require.NoError(t, os.Mkdir(fl.checkpoint+".known", 0o700)) // the cache file cannot be replaced: every save of it fails
+	now := time.Unix(1000, 0)
+	fl.now = func() time.Time { return now }
+	fl.saveNeeded()
+	require.True(t, fl.knownDirty)
+	// a checkpoint whose first save failed is due again
+	second := f.cert(t, f.h2)
+	require.ErrorIs(t, f.verify(second, 2), ErrShardConfPending)
+	f.resolve()
+	fl.mu.Lock()
+	fl.latest = f.pdr2
+	fl.unsaved = &checkpointJob{pdr: f.pdr2, uc: second}
+	fl.nextSave = now.Add(checkpointRetry)
+	fl.mu.Unlock()
+	for i := 0; i < 3; i++ { // the cache keeps failing and pushing its own deadline
+		now = now.Add(checkpointRetry + time.Second)
+		fl.retrySave()
+		if i == 0 {
+			_, err := os.Stat(fl.checkpoint)
+			require.NoError(t, err, "the checkpoint is written on its first due retry, whatever the cache does")
+		}
+	}
+	require.Nil(t, fl.unsaved)
+	require.True(t, fl.knownDirty)
+}
+
+// The need relation survives restarts: the persisted entries are what the latest view needed, and a restart recomputes the relation from
+// them, so a later resolution never evicts a sibling the same view still needs.
+func TestTheNeedRelationSurvivesRepeatedRestarts(t *testing.T) {
+	f := newFollowFixture(t)
+	fl := f.c.follow
+	fl.checkpoint = filepath.Join(t.TempDir(), "checkpoint.json")
+	left, right := types.ShardID{}.Split()
+	mk := func(shard types.ShardID, epoch uint64) *types.PartitionDescriptionRecord {
+		return &types.PartitionDescriptionRecord{Version: 1, NetworkID: 5, PartitionID: utbtest.Partition, PartitionTypeID: 7, TypeIDLen: 8, UnitIDLen: 256,
+			ShardID: shard, T2Timeout: time.Second, Epoch: epoch, EpochStart: epoch + 1}
+	}
+	sib := mk(right, 4)
+	sibHash := confHashOf(t, sib)
+	fl.mu.Lock()
+	fl.add(right, sibHash, sib)
+	fl.mu.Unlock()
+	fl.setNeeded(map[string][]byte{right.Key(): sibHash})
+	for restart := 0; restart < 3; restart++ {
+		next := newShardConfFollower(f.srv, f.pdr0, f.h0)
+		next.checkpoint = fl.checkpoint
+		next.restoreKnown(fl.checkpoint)
+		require.True(t, next.isKnown(right, sibHash), "restart %d keeps the sibling the view needs", restart)
+		// something else is resolved after the restart, and saved: the sibling is still needed by the same view
+		extra := mk(left, uint64(10+restart))
+		next.mu.Lock()
+		next.add(left, confHashOf(t, extra), extra)
+		next.mu.Unlock()
+		next.saveNeeded()
+		fl = next
+	}
+	last := newShardConfFollower(f.srv, f.pdr0, f.h0)
+	last.restoreKnown(fl.checkpoint)
+	require.True(t, last.isKnown(right, sibHash), "still there after several restarts")
+}
