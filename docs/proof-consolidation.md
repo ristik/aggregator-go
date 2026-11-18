@@ -144,6 +144,8 @@ latency numbers. The stop-writers negative control fails as intended
 independent pins, and the topology and configuration hashes come from the authenticated partition view (committed by the root quorum's seal). `BFT_CONSOLIDATION_TOPOLOGY_FILE` (and `confHash` in the CLI configuration) remain as an
 optional, stricter independent pin, exercised by `CONSOLIDATION_E2E_PINNED=1`.
 
+Each shard of a topology file may be marked `"follow": true`: its pin then follows live configuration changes (validator-registry kinds 6 and 8) to the configuration hash a seal-authenticated view leaf commits to, once this aggregator has resolved that configuration from the root (`BFT_RPC_ADDRESS`, the root's loopback `POST /api/v1/q3/shard-conf`) and checked it against the sealed hash. Without it a pin is fixed, and the operator updates the file. The rule is the same for views validated on intake and for the stored views revalidated at startup.
+
 ## Work bounds (asymptotic regression tests)
 
 `Counters` and `Stats` expose hardware-independent work metrics; the tests sweep the parameter and assert the bound

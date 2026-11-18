@@ -12,7 +12,10 @@ import (
 
 	"github.com/unicitynetwork/aggregator-go/internal/storage/interfaces"
 
+	"github.com/unicitynetwork/bft-core/network/protocol/certification"
 	"github.com/unicitynetwork/bft-go-base/types"
+
+	"github.com/unicitynetwork/aggregator-go/internal/proofmaterial"
 )
 
 // ucAuthenticator is the single boundary where unicity certificates received from
@@ -37,6 +40,11 @@ type ucAuthenticator struct {
 	// unchecked, tests only): a certificate that commits to another configuration is not this
 	// shard's.
 	shardConfHash []byte
+	// follow, when set, holds the configurations of the shard this authenticator knows (shardconf.go): a certificate that commits to any of
+	// them is checked against the one that applied to it, and an authentic one that commits to an unknown hash queues its resolution.
+	// shardConfHash is then the published (newest accepted) configuration. Both are guarded by confMu.
+	confMu sync.RWMutex
+	follow *shardConfFollower
 
 	mu    sync.Mutex
 	known map[[sha256.Size]byte]struct{}
@@ -104,7 +112,42 @@ func newUCAuthenticator(network types.NetworkID, store TrustBaseStore) *ucAuthen
 
 // withShardConfHash pins the configuration hash the certificates of this shard must commit to.
 func (a *ucAuthenticator) withShardConfHash(h []byte) *ucAuthenticator {
+	a.confMu.Lock()
+	defer a.confMu.Unlock()
 	a.shardConfHash = bytes.Clone(h)
+	a.follow = nil
+	return a
+}
+
+// currentConfHash is the published configuration hash (nil: unchecked).
+func (a *ucAuthenticator) currentConfHash() []byte {
+	a.confMu.RLock()
+	defer a.confMu.RUnlock()
+	return a.shardConfHash
+}
+
+// setPublishedConfHash moves the published configuration hash (the live configuration an accepted certificate commits to).
+func (a *ucAuthenticator) setPublishedConfHash(h []byte) {
+	a.confMu.Lock()
+	a.shardConfHash = bytes.Clone(h)
+	a.confMu.Unlock()
+}
+
+// knownConfHash reports whether h is a configuration hash this authenticator accepts for its shard.
+func (a *ucAuthenticator) knownConfHash(h []byte) bool {
+	if a.follow != nil {
+		return a.follow.isKnown(a.follow.ours, h)
+	}
+	cur := a.currentConfHash()
+	return cur != nil && bytes.Equal(cur, h)
+}
+
+// withShardConfFollower makes the authenticator follow the shard's configuration; h is the hash of the configuration it starts from.
+func (a *ucAuthenticator) withShardConfFollower(f *shardConfFollower, h []byte) *ucAuthenticator {
+	a.withShardConfHash(h)
+	a.confMu.Lock()
+	a.follow = f
+	a.confMu.Unlock()
 	return a
 }
 
@@ -201,6 +244,12 @@ type authOp struct {
 	localOnly bool
 	epochs    map[uint64]*opEpoch
 	seals     map[*types.UnicitySeal]error
+	// confHints are shard epochs an authenticated record names for the shard's configuration (the technical record's epoch): where
+	// the resolution of an unknown configuration hash looks first
+	confHints []uint64
+	// deferred is the response this operation verifies: when its configuration is unknown it is registered with the resolution and handed
+	// back to the message loop once it resolves
+	deferred any
 }
 
 type opEpoch struct {
@@ -271,10 +320,46 @@ func (o *authOp) verifyUC(uc *types.UnicityCertificate, partition types.Partitio
 	if err := validateUCShape(uc); err != nil {
 		return fmt.Errorf("malformed unicity certificate: %w", err)
 	}
+	// the configuration the certificate must commit to: a known one of the shard (the one that applied to it), else the published one; a
+	// hash that is none of them is judged by the seal first and then queued for resolution, never accepted on its own say
+	pin, unknown := a.currentConfHash(), false
+	if a.follow != nil {
+		if a.knownConfHash(uc.ShardConfHash) {
+			pin = uc.ShardConfHash
+		} else if pin != nil {
+			pin, unknown = nil, true
+		}
+	}
+	if err := o.verifyUCPinned(uc, partition, shard, pin); err != nil {
+		return err
+	}
+	if unknown {
+		hints := append([]uint64(nil), o.confHints...)
+		if ir := uc.InputRecord; ir != nil {
+			hints = append(hints, ir.Epoch+1, ir.Epoch)
+		}
+		deferred := o.deferredResponse()
+		switch a.follow.request(a.follow.ours, uc.ShardConfHash, hints, deferred) {
+		case confKnown:
+			return nil // resolved in the meantime: the certificate verifies against the configuration it commits to
+		case confRefused:
+			return fmt.Errorf("%w: the certificate commits to configuration %X", ErrShardConfBusy, uc.ShardConfHash)
+		}
+		return fmt.Errorf("%w: the certificate commits to configuration %X", ErrShardConfPending, uc.ShardConfHash)
+	}
+	return nil
+}
+
+// verifyUCPinned authenticates the certificate of the shard; pin, when not nil, is the configuration hash it must commit to.
+func (o *authOp) verifyUCPinned(uc *types.UnicityCertificate, partition types.PartitionID, shard types.ShardID, pin []byte) error {
+	a := o.a
+	if uc.UnicitySeal == nil {
+		return errors.New("unicity certificate has no seal")
+	}
 	if uc.UnicitySeal.NetworkID != a.network {
 		return fmt.Errorf("unicity seal is of network %d, configured network is %d", uc.UnicitySeal.NetworkID, a.network)
 	}
-	if err := uc.IsValid(partition, shard, a.shardConfHash); err != nil {
+	if err := uc.IsValid(partition, shard, pin); err != nil {
 		return fmt.Errorf("invalid unicity certificate: %w", err)
 	}
 	shardRoot, err := uc.ShardTreeCertificate.ComputeCertificateHash(uc.InputRecord, uc.TRHash, uc.ShardConfHash, crypto.SHA256)
@@ -289,6 +374,21 @@ func (o *authOp) verifyUC(uc *types.UnicityCertificate, partition types.Partitio
 		return fmt.Errorf("unicity seal hash %X does not match with the root hash of the unicity tree %X", uc.UnicitySeal.Hash, root)
 	}
 	return o.verifySeal(uc.UnicitySeal)
+}
+
+// deferredResponse is the response to register with a lookup: its optional sidecar is validated first (against the seal, pins aside) and left
+// out when it does not validate, so the replay carries only a view that was usable.
+func (o *authOp) deferredResponse() any {
+	cr, ok := o.deferred.(*certification.CertificationResponse)
+	if !ok || cr == nil || len(cr.PartitionView) == 0 {
+		return o.deferred
+	}
+	if _, _, err := proofmaterial.ValidateView(cr.PartitionView, &cr.UC, o.sealVerifier(), nil); err == nil {
+		return cr
+	}
+	plain := *cr
+	plain.PartitionView = nil
+	return &plain
 }
 
 // AdmittedTrustBases is the optional lookup of trust bases already admitted to the local

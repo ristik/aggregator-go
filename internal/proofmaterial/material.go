@@ -4,11 +4,13 @@
 package proofmaterial
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/unicitynetwork/bft-go-base/types"
 
@@ -147,6 +149,9 @@ func ValidateView(raw []byte, uc *types.UnicityCertificate, verifier types.SealV
 		return ResultMalformed, nil, err
 	}
 	var opts []types.AuthOption
+	if st, ok := pins.(*StaticTopology); ok && st != nil {
+		pins = viewPins{st.forView(view)} // following shards move with the configurations resolved; fixed pins do not
+	}
 	if topo, ok := topologyFor(pins, api.AggregationPartitionID); ok {
 		if err := checkTopology(topo); err != nil {
 			return ResultNoTopology, nil, err
@@ -175,7 +180,10 @@ func checkTopology(topo types.PartitionViewTopology) error {
 
 // StaticTopology is a fixed trusted topology of the aggregation partition (api.AggregationPartitionID).
 type StaticTopology struct {
-	topo types.PartitionViewTopology
+	mu     sync.RWMutex
+	topo   types.PartitionViewTopology
+	follow map[string]bool
+	known  func(shard types.ShardID, hash []byte) bool
 }
 
 // NewStaticTopology builds and checks a trusted topology: scheme must be complete and
@@ -201,7 +209,88 @@ func (s *StaticTopology) Topology(partition types.PartitionID) (types.PartitionV
 	if s == nil || partition != api.AggregationPartitionID {
 		return types.PartitionViewTopology{}, false
 	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.topo, true
+}
+
+// Pin is the configuration hash pinned for a shard.
+func (s *StaticTopology) Pin(shard types.ShardID) ([]byte, bool) {
+	if s == nil {
+		return nil, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	h, ok := s.topo.ShardConfHashes[shard.Key()]
+	return h, ok
+}
+
+// SetFollowing marks the shards (by ShardID.Key()) whose pins follow live configuration changes; every other pin is fixed.
+func (s *StaticTopology) SetFollowing(shards map[string]bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.follow = make(map[string]bool, len(shards))
+	for k, v := range shards {
+		s.follow[k] = v
+	}
+}
+
+// Following reports whether the pin of the shard follows live configuration changes.
+func (s *StaticTopology) Following(shard types.ShardID) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.follow[shard.Key()]
+}
+
+// SetKnown connects the topology to the configurations a client resolved: known reports whether a hash is a verified configuration of a shard.
+func (s *StaticTopology) SetKnown(known func(shard types.ShardID, hash []byte) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.known = known
+}
+
+// forView is the topology a view is validated against: the pins, where a following shard's pin is replaced by the hash its leaf commits to
+// when that is a verified configuration of that shard. A fixed pin is never replaced, and the receiver is not modified. This one rule serves
+// live intake and the revalidation of stored views alike.
+func (s *StaticTopology) forView(view *types.PartitionViewV1) types.PartitionViewTopology {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	topo := s.topo
+	if s.known == nil || len(s.follow) == 0 {
+		return topo
+	}
+	var next map[string][]byte
+	for _, leaf := range view.Leaves {
+		k := leaf.ShardID.Key()
+		pin, ok := topo.ShardConfHashes[k]
+		if !ok || !s.follow[k] || bytes.Equal(pin, leaf.ShardConfHash) || len(leaf.ShardConfHash) != ConfHashSize || !s.known(leaf.ShardID, leaf.ShardConfHash) {
+			continue
+		}
+		if next == nil {
+			next = make(map[string][]byte, len(topo.ShardConfHashes))
+			for kk, v := range topo.ShardConfHashes {
+				next[kk] = v
+			}
+		}
+		next[k] = leaf.ShardConfHash
+	}
+	if next == nil {
+		return topo
+	}
+	return types.PartitionViewTopology{Scheme: topo.Scheme, ShardConfHashes: next}
+}
+
+// viewPins is the pinned topology of one validation.
+type viewPins struct{ topo types.PartitionViewTopology }
+
+func (v viewPins) Topology(partition types.PartitionID) (types.PartitionViewTopology, bool) {
+	if partition != api.AggregationPartitionID {
+		return types.PartitionViewTopology{}, false
+	}
+	return v.topo, true
 }
 
 func topologyFor(p TopologyProvider, partition types.PartitionID) (types.PartitionViewTopology, bool) {

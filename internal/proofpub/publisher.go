@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/unicitynetwork/bft-go-base/types"
 
@@ -57,6 +58,8 @@ type Publisher struct {
 	log      *logger.Logger
 	// sealVerifier authenticates stored views again (nil: stored views are not republished).
 	sealVerifier func(ctx context.Context) types.SealVerifier
+	// configs resolves the configurations a stored view needs (nil: a view that does not validate is dropped)
+	configs ViewConfigs
 	// notify wakes long-poll waiters after a publication outcome which no finalization path
 	// reports itself: late certification material. Finalization publishes
 	// first and its caller notifies afterwards, once the proof-ready update is done (a wake
@@ -121,6 +124,21 @@ func New(catalog *proofview.Catalog, backend smtbackend.Backend, topology proofm
 		return nil
 	}
 	return &Publisher{catalog: catalog, retainer: retainer, backend: backend, topology: topology, log: log}
+}
+
+// ViewConfigs resolves, through the client's seal-verified lookup path and its single worker, the shard configurations a stored partition view
+// needs under the topology rules (a following pin whose leaf commits to a configuration not resolved yet). It reports whether it queued any
+// resolution; whenResolved is called once, after every one of them resolved.
+type ViewConfigs interface {
+	PendingViewConfigs(view []byte, uc *types.UnicityCertificate, verifier types.SealVerifier, whenResolved func()) bool
+}
+
+// SetViewConfigs makes the publisher resolve the configurations a stored view needs before it publishes the view, instead of dropping a view
+// whose configurations a restarted process has not resolved yet.
+func (p *Publisher) SetViewConfigs(v ViewConfigs) {
+	if p != nil {
+		p.configs = v
+	}
 }
 
 // SetSealVerifier sets the trusted seal verifier used to re-authenticate stored
@@ -263,12 +281,13 @@ func (p *Publisher) publish(ctx context.Context, block *models.Block, strict, un
 		fail(ResultRootMismatch, nil)
 		return
 	}
+	view, deferView := p.viewFor(ctx, block, &uc, admitted)
 	// Publish takes ownership of rv (closes it on failure).
 	err = p.catalog.Publish(ctx, proofview.PublishInput{
 		Block:  proofview.BlockIdentity{Number: block.Index, ConfigLineage: lineage},
 		Root:   append([]byte(nil), block.RootHash...),
 		Reader: rv,
-		Cert:   proofview.Certification{UC: block.UnicityCertificate, PartitionView: p.viewFor(ctx, block, &uc, admitted)},
+		Cert:   proofview.Certification{UC: block.UnicityCertificate, PartitionView: view},
 	})
 	if err != nil {
 		// ErrBudget already made latest unavailable inside the catalog
@@ -277,39 +296,89 @@ func (p *Publisher) publish(ctx context.Context, block *models.Block, strict, un
 	}
 	metrics.ProofViewPublicationTotal.WithLabelValues(ResultPublished).Inc()
 	p.clearFailure()
+	if deferView {
+		// the block is in the catalog: only now can the sidecar's configurations be resolved and the sidecar attached, whatever order they finish in
+		p.completeStoredView(block, &uc) // inline: it only validates and registers the lookups (their callbacks run on the worker), so the caller has queued them when this returns
+	}
 }
 
 // revalidatedView re-checks the block's partition view against its own UC. A view
 // that does not validate is dropped (the certification is published without it).
-func (p *Publisher) viewFor(ctx context.Context, block *models.Block, uc *types.UnicityCertificate, admitted bool) []byte {
+func (p *Publisher) viewFor(ctx context.Context, block *models.Block, uc *types.UnicityCertificate, admitted bool) (view []byte, deferred bool) {
 	if len(block.PartitionView) == 0 {
-		return nil
+		return nil, false
 	}
 	if admitted {
 		metrics.ProofViewPublicationTotal.WithLabelValues("view_admitted").Inc()
-		return append([]byte(nil), block.PartitionView...)
+		return append([]byte(nil), block.PartitionView...), false
 	}
 	return p.revalidatedView(ctx, block, uc)
 }
 
-// revalidatedView re-authenticates a stored view against its own UC with the trusted seal
-// verifier. A view that does not authenticate is dropped (the certification is published
-// without it); without a verifier nothing stored is republished.
-func (p *Publisher) revalidatedView(ctx context.Context, block *models.Block, uc *types.UnicityCertificate) []byte {
+// revalidatedView re-authenticates a stored view against its own UC with the trusted seal verifier. A view that does not authenticate is dropped
+// (the certification is published without it); without a verifier nothing stored is republished. A view that does not validate only because a
+// following shard's configuration is not resolved yet is deferred: the certification is published without it and completeStoredView finishes it.
+func (p *Publisher) revalidatedView(ctx context.Context, block *models.Block, uc *types.UnicityCertificate) (view []byte, deferred bool) {
 	var verifier types.SealVerifier
 	if p.sealVerifier != nil {
 		verifier = p.sealVerifier(ctx)
 	}
 	if verifier != nil {
 		if _, view, err := proofmaterial.ValidateView(block.PartitionView, uc, verifier, p.topology); err == nil {
-			return view
+			return view, false
+		} else if p.configs != nil {
+			p.log.WithContext(ctx).Info("Deferring the stored partition view until its shard configurations are resolved", "block", block.Index.String())
+			metrics.ProofViewPublicationTotal.WithLabelValues("view_deferred").Inc()
+			return nil, true
 		} else {
 			p.log.WithContext(ctx).Warn("Dropping stored partition view which does not validate against its UC",
 				"block", block.Index.String(), "error", err.Error())
 		}
 	}
 	metrics.ProofViewPublicationTotal.WithLabelValues("view_dropped").Inc()
-	return nil
+	return nil, false
+}
+
+// completeStoredView finishes a deferred view of a block that is already in the catalog. It is idempotent and retrying: it validates the
+// stored view again; when it validates it is attached to exactly that block and certification; when a configuration is still missing the
+// resolution is queued again (with its callback, which runs this function again) until the view validates or the block is no longer
+// retained (superseded); a view that fails for any other reason is dropped.
+func (p *Publisher) completeStoredView(block *models.Block, uc *types.UnicityCertificate) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var verifier types.SealVerifier
+	if p.sealVerifier != nil {
+		verifier = p.sealVerifier(ctx)
+	}
+	if verifier == nil {
+		return
+	}
+	_, view, err := proofmaterial.ValidateView(block.PartitionView, uc, verifier, p.topology)
+	if err != nil {
+		// a configuration may still be missing: queue it (the callback comes back here), unless nothing is pending for it
+		if p.configs != nil && p.configs.PendingViewConfigs(block.PartitionView, uc, verifier, func() { p.completeStoredView(block, uc) }) {
+			return
+		}
+		if _, _, again := proofmaterial.ValidateView(block.PartitionView, uc, verifier, p.topology); again == nil {
+			p.completeStoredView(block, uc) // the last dependency became known while it was being registered
+			return
+		}
+		p.log.WithContext(ctx).Warn("Dropping stored partition view which does not validate", "block", block.Index.String(), "error", err.Error())
+		metrics.ProofViewPublicationTotal.WithLabelValues("view_dropped").Inc()
+		return
+	}
+	id := proofview.BlockIdentity{Number: block.Index, ConfigLineage: append([]byte(nil), uc.ShardConfHash...)}
+	switch err := p.catalog.AttachCertification(ctx, id, block.RootHash, proofview.Certification{UC: block.UnicityCertificate, PartitionView: view}); {
+	case err == nil:
+		metrics.ProofViewPublicationTotal.WithLabelValues(ResultAttached).Inc()
+		p.wake()
+	case errors.Is(err, proofview.ErrViewNotRetained):
+		// superseded: the block is no longer retained, nothing to attach to
+		metrics.ProofViewPublicationTotal.WithLabelValues(ResultAttachMiss).Inc()
+	default:
+		p.log.WithContext(ctx).Warn("Could not attach the stored partition view", "block", block.Index.String(), "error", err.Error())
+		metrics.ProofViewPublicationTotal.WithLabelValues(ResultAttachFailed).Inc()
+	}
 }
 
 // PublishProofMaterial implements proofmaterial.Sink: it attaches accepted

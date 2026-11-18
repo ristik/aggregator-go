@@ -13,6 +13,7 @@ import (
 	"github.com/unicitynetwork/aggregator-go/internal/utb"
 	"github.com/unicitynetwork/bft-core/gettrustbase"
 	"math/big"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	cryptobft "github.com/unicitynetwork/bft-go-base/crypto"
 	"github.com/unicitynetwork/bft-go-base/types"
 
+	"github.com/unicitynetwork/aggregator-go/internal/bft/rest"
 	"github.com/unicitynetwork/aggregator-go/internal/config"
 	"github.com/unicitynetwork/aggregator-go/internal/events"
 	"github.com/unicitynetwork/aggregator-go/internal/logger"
@@ -111,6 +113,10 @@ type (
 		history      IntakeTrustBases
 		members      *Membership
 		catchup      *catchUp
+		// follow resolves and holds the shard's configurations across live changes (shardconf.go); reinject carries a certificate dropped while its
+		// configuration was being resolved back to the message loop (each is registered with its lookup, shardconf.go)
+		follow   *shardConfFollower
+		reinject chan any
 		// highest root round of an authenticated, sequence-checked UC; only an advance refreshes
 		// lastCertResponseTime
 		lastAuthRootRound atomic.Uint64
@@ -208,6 +214,11 @@ func NewBFTClient(
 		return nil, fmt.Errorf("invalid consolidation topology: %w", err)
 	}
 	bftClient.proofTopology = topo
+	if conf.RPCAddress != "" {
+		// the shard's configuration changes live (validator-registry kinds 6 and 8): successors are fetched from the root and checked against
+		// the hash its seal committed to
+		bftClient.SetShardConfSource(rest.NewBFTRestClient(conf.RPCAddress))
+	}
 	bftClient.status.Store(idle)
 	bftClient.luc.Store(luc)
 	bftClient.lastCertResponseTime.Store(time.Now().UnixMilli())
@@ -519,6 +530,8 @@ func (c *BFTClientImpl) loop(ctx context.Context, bftNetwork *BftNetwork, nodeID
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case m := <-c.reinject: // a nil channel (no shard configuration source) never selects
+			c.handleMessage(ctx, m)
 		case m, ok := <-received:
 			if !ok {
 				return errors.New("network received channel is closed")
@@ -587,6 +600,14 @@ func (c *BFTClientImpl) logResponseError(ctx context.Context, kind string, err e
 		c.logger.WithContext(ctx).Debug("ignoring a stale unicity certificate (a root that lags)", "message", kind, "reason", err.Error())
 		return
 	}
+	if errors.Is(err, ErrShardConfBusy) {
+		c.logger.WithContext(ctx).Warn("certificate refused: shard configuration lookups are at capacity; the root sends it again", "message", kind, "reason", err.Error())
+		return
+	}
+	if errors.Is(err, ErrShardConfPending) {
+		c.logger.WithContext(ctx).Info("certificate deferred until its shard configuration is resolved", "message", kind, "reason", err.Error())
+		return
+	}
 	c.logger.WithContext(ctx).Error("error processing "+kind+" message", "error", err.Error())
 }
 
@@ -617,6 +638,10 @@ func (c *BFTClientImpl) handleCertificationResponse(ctx context.Context, cr *cer
 	// view of the same response is authenticated within the same operation (one resolution of
 	// the authority and history, one judgment of the shared seal)
 	op := c.authn.beginIntake(ctx)
+	op.deferred = cr
+	if cr.Technical.HashMatches(cr.UC.TRHash) == nil {
+		op.confHints = []uint64{cr.Technical.Epoch} // the authenticated technical record names the shard epoch: resolve a new configuration there
+	}
 	if err := op.verifyUC(&cr.UC, c.partitionID, c.shardID); err != nil {
 		if errors.Is(err, ErrEpochNotAdmitted) {
 			c.catchup.Signal()
@@ -632,10 +657,15 @@ func (c *BFTClientImpl) handleCertificationResponse(ctx context.Context, cr *cer
 		cr.UC.GetRoundNumber(), cr.Technical.Round, cr.Technical.Leader))
 
 	// Only the response's own UC is processed; the view's other leaves are never dispatched.
-	c.stagePartitionViewOp(ctx, op, cr)
+	staged := c.stagePartitionViewOp(ctx, op, cr)
 
 	if err := c.handleUnicityCertificate(ctx, &cr.UC, &cr.Technical); err != nil {
 		return err
+	}
+	if staged {
+		// the sequence check accepted the certificate: only now does its view's configuration need become what a restart resumes with, and only
+		// if the view is newer than the one persisted (a delayed replay of an older response never replaces it)
+		c.noteViewConfigs(cr)
 	}
 	c.publishSidecarFill(ctx, &cr.UC)
 	return nil
@@ -700,6 +730,7 @@ func (c *BFTClientImpl) handleUnicityCertificate(ctx context.Context, uc *types.
 		return fmt.Errorf("failed to check repeat UC: %w", err)
 	}
 	c.noteAuthenticated(ctx, uc)
+	c.publishConf(uc) // accepted sequence progress: the configuration this certificate commits to is the live one
 	if isRepeat {
 		c.logger.WithContext(ctx).Warn("Received repeat UC - root chain timed out waiting for certification",
 			"partitionRound", uc.GetRoundNumber(),
@@ -1034,7 +1065,11 @@ func proofTopologyFromConfig(conf *config.BFTConfig) (proofmaterial.TopologyProv
 	}
 	scheme := make(types.ShardingScheme, 0, len(conf.ConsolidationShards))
 	hashes := make(map[string][]byte, len(conf.ConsolidationShards))
+	following := map[string]bool{}
 	for _, sh := range conf.ConsolidationShards {
+		if sh.Follow {
+			following[sh.ShardID.Key()] = true
+		}
 		h, err := hex.DecodeString(strings.TrimPrefix(sh.ConfigHash, "0x"))
 		if err != nil {
 			return nil, fmt.Errorf("shard %q configuration hash: %w", sh.ShardID, err)
@@ -1052,6 +1087,7 @@ func proofTopologyFromConfig(conf *config.BFTConfig) (proofmaterial.TopologyProv
 	if err != nil {
 		return nil, err
 	}
+	t.SetFollowing(following)
 	return t, nil
 }
 
@@ -1102,6 +1138,210 @@ func (c *BFTClientImpl) noteAuthenticated(ctx context.Context, uc *types.Unicity
 	}
 }
 
+// SetShardConfSource makes the client follow the shard's configuration across a live change (validator-registry kinds 6 and 8): a
+// certificate that authenticates and commits to a configuration this client does not know is dropped, its hash is resolved off the message
+// loop through the source (the answer must hash to the sealed value), and the certificate is re-admitted. The newest configuration an accepted
+// certificate commits to is persisted (BFT_SHARD_CONF_CHECKPOINT_FILE) and resumed from at restart. Without a source the client keeps verifying
+// against the configuration it started with. Call before Start.
+func (c *BFTClientImpl) SetShardConfSource(src ShardConfSource) {
+	c.setShardConfSource(src, true)
+}
+
+// setShardConfSource is SetShardConfSource; autostart runs the worker on the first lookup (every source installed through the public setter
+// and the constructor), tests that step the worker themselves turn it off.
+func (c *BFTClientImpl) setShardConfSource(src ShardConfSource, autostart bool) {
+	if src == nil || c.conf == nil || c.conf.ShardConf == nil {
+		return
+	}
+	f := newShardConfFollower(src, c.conf.ShardConf, c.authn.currentConfHash())
+	f.autostart = autostart
+	f.deliver = c.redeliver
+	f.checkpoint = c.conf.ShardConfCheckpointFile
+	c.authn.withShardConfFollower(f, c.authn.currentConfHash())
+	c.follow = f
+	c.reinject = make(chan any, 16)
+	c.followTopology()
+	if f.checkpoint != "" {
+		f.restoreKnown(f.checkpoint)
+		verify := func(uc *types.UnicityCertificate) error {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return c.authn.beginIntake(ctx).verifyUCPinned(uc, c.partitionID, c.shardID, nil)
+		}
+		if err := f.restore(f.checkpoint, verify); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				c.logger.Warn("Ignoring the shard configuration checkpoint", "file", f.checkpoint, "error", err.Error())
+			}
+		} else if latest := f.latestHash(); latest != nil {
+			c.authn.setPublishedConfHash(latest)
+		}
+	}
+}
+
+// redeliver hands a response that was deferred for its configuration back to the message loop, and reports whether it was taken: a full
+// channel leaves it with the follower, which offers it again on its next pass (it is never dropped for a full channel).
+func (c *BFTClientImpl) redeliver(m any) bool {
+	if cb, ok := m.(*confCallback); ok {
+		go cb.fn() // a resolution a consumer (the proof publisher at startup) waits for: it runs off the follower's mutex
+		return true
+	}
+	select {
+	case c.reinject <- m:
+		return true
+	default:
+		return false
+	}
+}
+
+// confCallback is a waiter that runs a function once its lookup resolves (not a response to replay).
+type confCallback struct{ fn func() }
+
+// PendingViewConfigs implements proofpub.ViewConfigs: the stored view of the durable finalized block is authenticated by its seal first (the
+// pins aside), then every following shard whose leaf commits to a configuration this client has not resolved gets a lookup on the existing
+// worker. It reports whether any was queued; whenResolved runs once, after all of them resolved.
+func (c *BFTClientImpl) PendingViewConfigs(view []byte, uc *types.UnicityCertificate, verifier types.SealVerifier, whenResolved func()) bool {
+	topo, static := c.proofTopology.(*proofmaterial.StaticTopology)
+	if !static || c.follow == nil || verifier == nil {
+		return false
+	}
+	if _, _, err := proofmaterial.ValidateView(view, uc, verifier, nil); err != nil {
+		return false
+	}
+	decoded, err := types.DecodePartitionViewV1(view)
+	if err != nil {
+		return false
+	}
+	type need struct {
+		shard types.ShardID
+		hash  []byte
+		hints []uint64
+	}
+	var needs []need
+	for _, leaf := range decoded.Leaves {
+		pin, ok := topo.Pin(leaf.ShardID)
+		if !ok || !topo.Following(leaf.ShardID) || bytes.Equal(pin, leaf.ShardConfHash) || c.follow.isKnown(leaf.ShardID, leaf.ShardConfHash) {
+			continue
+		}
+		n := need{shard: leaf.ShardID, hash: leaf.ShardConfHash}
+		if leaf.InputRecord != nil {
+			n.hints = []uint64{leaf.InputRecord.Epoch + 1, leaf.InputRecord.Epoch}
+		}
+		needs = append(needs, n)
+	}
+	if len(needs) == 0 {
+		return false
+	}
+	var remaining atomic.Int32
+	remaining.Store(int32(len(needs)))
+	done := func() {
+		if remaining.Add(-1) == 0 {
+			whenResolved()
+		}
+	}
+	queued := 0
+	for _, n := range needs {
+		switch c.follow.request(n.shard, n.hash, n.hints, &confCallback{fn: done}) {
+		case confQueued:
+			queued++
+		case confKnown:
+			// resolved meanwhile. If it was the last outstanding need: with nothing queued there is nothing to defer (the caller revalidates); with
+			// lookups queued whose callbacks already ran, this registration is what completes the set, so the callback runs now.
+			if remaining.Add(-1) == 0 {
+				if queued == 0 {
+					return false
+				}
+				whenResolved()
+				return true
+			}
+		case confRefused:
+			c.logger.Warn("A stored partition view could not be deferred: shard configuration lookups are at capacity", "shard", n.shard.String())
+			return false
+		}
+	}
+	return queued > 0
+}
+
+// followTopology connects the pinned consolidation topology (when there is one) to the configurations this client resolved: its shards
+// marked as following move with them, in live intake and in the stored views the publisher revalidates alike.
+func (c *BFTClientImpl) followTopology() {
+	if t, ok := c.proofTopology.(*proofmaterial.StaticTopology); ok && c.follow != nil {
+		t.SetKnown(c.follow.isKnown)
+	}
+}
+
+// publishConf makes the configuration an accepted certificate commits to the live configuration (and persists it).
+func (c *BFTClientImpl) publishConf(uc *types.UnicityCertificate) {
+	if c.follow == nil {
+		return
+	}
+	if pdr, ok, err := c.follow.publish(uc); ok {
+		c.authn.setPublishedConfHash(uc.ShardConfHash)
+		if err != nil {
+			c.logger.Warn("Could not persist the shard configuration checkpoint: a restart resolves the configuration again", "error", err.Error())
+		}
+		c.logger.Info("Shard configuration changed", "epoch", pdr.Epoch, "configHash", hex.EncodeToString(uc.ShardConfHash))
+	}
+}
+
+// noteViewConfigs records which configurations the latest staged view needed (one per shard, replacing the previous view's), so the
+// persisted set holds exactly what a restart needs to validate it again.
+func (c *BFTClientImpl) noteViewConfigs(cr *certification.CertificationResponse) {
+	topo, static := c.proofTopology.(*proofmaterial.StaticTopology)
+	if !static || c.follow == nil {
+		return
+	}
+	view, err := types.DecodePartitionViewV1(cr.PartitionView)
+	if err != nil {
+		return
+	}
+	needed := map[string][]byte{}
+	for _, leaf := range view.Leaves {
+		if pin, ok := topo.Pin(leaf.ShardID); ok && topo.Following(leaf.ShardID) && !bytes.Equal(pin, leaf.ShardConfHash) {
+			needed[leaf.ShardID.Key()] = bytes.Clone(leaf.ShardConfHash)
+		}
+	}
+	if len(needed) > 0 {
+		c.follow.setNeeded(needed, cr.UC.GetRootRoundNumber())
+	}
+}
+
+// deferViewForConfigs reports whether the view of a response must wait for configurations to be resolved: a leaf of a shard whose pin is
+// marked as following and differs from the seal-authenticated hash the leaf commits to, which this client has not resolved yet. Its lookup is
+// queued with the response registered, so the sidecar is handed back for another attempt once the configuration is known (the topology
+// itself applies the same rule, in live intake and in the stored views the publisher revalidates).
+func (c *BFTClientImpl) deferViewForConfigs(cr *certification.CertificationResponse, op *authOp) (deferred, refused bool) {
+	topo, static := c.proofTopology.(*proofmaterial.StaticTopology)
+	if !static || c.follow == nil {
+		return false, false
+	}
+	if _, _, err := proofmaterial.ValidateView(cr.PartitionView, &cr.UC, op.sealVerifier(), nil); err != nil {
+		return false, false // the ordinary validation reports why
+	}
+	view, err := types.DecodePartitionViewV1(cr.PartitionView)
+	if err != nil {
+		return false, false
+	}
+	pending, refusedAny := false, false
+	for _, leaf := range view.Leaves {
+		pin, ok := topo.Pin(leaf.ShardID)
+		if !ok || !topo.Following(leaf.ShardID) || bytes.Equal(pin, leaf.ShardConfHash) || c.follow.isKnown(leaf.ShardID, leaf.ShardConfHash) {
+			continue
+		}
+		var hints []uint64
+		if leaf.InputRecord != nil {
+			hints = []uint64{leaf.InputRecord.Epoch + 1, leaf.InputRecord.Epoch}
+		}
+		switch c.follow.request(leaf.ShardID, leaf.ShardConfHash, hints, cr) {
+		case confRefused:
+			c.logger.Warn("A partition view could not be deferred for a sibling shard configuration: lookups are at capacity", "shard", leaf.ShardID.String())
+			refusedAny = true
+		case confQueued:
+			pending = true
+		}
+	}
+	return pending, refusedAny
+}
+
 // ProofTopology returns the optional independently pinned topology (nil: none configured).
 func (c *BFTClientImpl) ProofTopology() proofmaterial.TopologyProvider { return c.proofTopology }
 
@@ -1125,6 +1365,7 @@ func (c *BFTClientImpl) SetProofMaterialSink(sink proofmaterial.Sink) {
 // partition views. Call before Start.
 func (c *BFTClientImpl) SetProofTopologyProvider(p proofmaterial.TopologyProvider) {
 	c.proofTopology = p
+	c.followTopology()
 }
 
 // stagePartitionView validates the sidecar of an already authenticated UC and stages it.
@@ -1137,28 +1378,38 @@ func (c *BFTClientImpl) stagePartitionView(ctx context.Context, cr *certificatio
 }
 
 // stagePartitionViewOp is stagePartitionView within the intake operation "op".
-func (c *BFTClientImpl) stagePartitionViewOp(ctx context.Context, op *authOp, cr *certification.CertificationResponse) {
+func (c *BFTClientImpl) stagePartitionViewOp(ctx context.Context, op *authOp, cr *certification.CertificationResponse) (staged bool) {
 	if cr.PartitionView == nil {
-		return
+		return false
 	}
 	if proofmaterial.IsUnshardedUC(&cr.UC) {
 		// the UC of an unsharded partition is complete by itself: the sidecar of a one-leaf
 		// partition is neither validated, staged, persisted nor served
 		metrics.BFTPartitionViewTotal.WithLabelValues("unsharded_skipped").Inc()
-		return
+		return false
+	}
+	if deferred, refused := c.deferViewForConfigs(cr, op); deferred || refused {
+		// a view that no lookup retained is refused, not pending
+		label := "config_pending"
+		if refused && !deferred { // a lookup that holds the view hands it back; refused only when none does
+			label = "config_refused"
+		}
+		metrics.BFTPartitionViewTotal.WithLabelValues(label).Inc()
+		return false
 	}
 	result, view, err := proofmaterial.ValidateView(cr.PartitionView, &cr.UC, op.sealVerifier(), c.proofTopology)
 	metrics.BFTPartitionViewTotal.WithLabelValues(result).Inc()
 	if err != nil {
 		c.logger.WithContext(ctx).Warn("Ignoring partition view sidecar",
 			"result", result, "error", truncate(err.Error(), 200), "rootRound", cr.UC.GetRootRoundNumber())
-		return
+		return false
 	}
 	digest, _, err := proofmaterial.DigestOfUC(&cr.UC)
 	if err != nil {
-		return
+		return false
 	}
 	c.proofStaging.Put(digest, view)
+	return true
 }
 
 func truncate(s string, n int) string {

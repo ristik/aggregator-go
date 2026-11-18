@@ -338,6 +338,9 @@ type BFTConfig struct {
 
 	// BFT node REST api address
 	RPCAddress string `mapstructure:"rpc_address"`
+	// ShardConfCheckpointFile persists the newest shard configuration an accepted certificate committed to (a validator-registry kind 6 or 8
+	// change), with that certificate, so a restart resumes from it ("": not persisted; BFT_SHARD_CONF_CHECKPOINT_FILE)
+	ShardConfCheckpointFile string `mapstructure:"shard_conf_checkpoint_file"`
 
 	// UTB enables the signed trust-base history (record version 2) instead of the version 1 trust bases.
 	UTB UTBConfig `mapstructure:"utb"`
@@ -347,6 +350,10 @@ type BFTConfig struct {
 type ConsolidationShard struct {
 	ShardID    types.ShardID `json:"shardId"`
 	ConfigHash string        `json:"configHash"` // hex SHA-256 of the shard's PartitionDescriptionRecord
+	// Follow marks the pin as following: after a live configuration change (validator-registry kind 6 or 8) the seal-authenticated hash of a
+	// configuration this client resolved for the shard replaces the pin. Without it the pin is fixed: a view that commits to any other
+	// configuration is not validated, and the operator updates the topology file.
+	Follow bool `json:"follow,omitempty"`
 }
 
 // UTBConfig is the signed trust-base history of a deployment whose roots publish signed entries. It is enabled by the pinned genesis EntryID; the shipped
@@ -524,6 +531,7 @@ func Load() (*Config, error) {
 		Enabled:                    getEnvBoolOrDefault("BFT_ENABLED", true),
 		Address:                    getEnvOrDefault("BFT_ADDRESS", "/ip4/0.0.0.0/tcp/9000"),
 		RPCAddress:                 getEnvOrDefault("BFT_RPC_ADDRESS", "http://127.0.0.1:8002"),
+		ShardConfCheckpointFile:    getEnvOrDefault("BFT_SHARD_CONF_CHECKPOINT_FILE", "bft-config/shard-conf-checkpoint.json"),
 		AnnounceAddresses:          strings.Split(getEnvOrDefault("BFT_ANNOUNCE_ADDRESSES", ""), ","),
 		BootstrapAddresses:         strings.Split(getEnvOrDefault("BFT_BOOTSTRAP_ADDRESSES", ""), ","),
 		BootstrapConnectRetry:      getEnvIntOrDefault("BFT_BOOTSTRAP_CONNECT_RETRY", 3),
