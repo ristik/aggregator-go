@@ -86,7 +86,6 @@ type (
 
 		msgLoopCancelFn context.CancelFunc
 		msgLoopDone     chan struct{}
-		followDone      chan struct{}
 		stopDone        chan struct{}
 
 		// timestamp when last UC was received
@@ -219,6 +218,11 @@ func NewBFTClient(
 		// the shard's configuration changes live (validator-registry kinds 6 and 8): successors are fetched from the root and checked against
 		// the hash its seal committed to
 		bftClient.SetShardConfSource(rest.NewBFTRestClient(conf.RPCAddress))
+		// the worker runs for the life of the process, on the first lookup, on every replica: activation (a leader, a follower that is promoted) is
+		// not needed to resolve the configurations the stored view of the latest block waits for
+		if bftClient.follow != nil {
+			bftClient.follow.autostart = true
+		}
 	}
 	bftClient.status.Store(idle)
 	bftClient.luc.Store(luc)
@@ -395,16 +399,6 @@ func (c *BFTClientImpl) Start(ctx context.Context) error {
 	// root key replacement while this node was down must not deadlock behind the peer filter)
 	c.catchup.Signal()
 	go c.catchup.Run(msgLoopCtx)
-	followDone := make(chan struct{})
-	c.followDone = followDone
-	if c.follow != nil {
-		go func() {
-			defer close(followDone)
-			c.follow.run(msgLoopCtx)
-		}()
-	} else {
-		close(followDone)
-	}
 	go func() {
 		defer close(msgLoopDone)
 		c.logger.WithContext(ctx).Info("BFT client event loop started")
@@ -467,16 +461,11 @@ func (c *BFTClientImpl) Stop() {
 
 	msgLoopDone := c.msgLoopDone
 	c.msgLoopDone = nil
-	followDone := c.followDone
-	c.followDone = nil
 	c.mu.Unlock()
 	c.ucProcessingMutex.Unlock()
 
 	if msgLoopDone != nil {
 		<-msgLoopDone
-	}
-	if followDone != nil {
-		<-followDone // one configuration worker at a time across stop and start
 	}
 
 	c.mu.Lock()
@@ -1253,8 +1242,14 @@ func (c *BFTClientImpl) PendingViewConfigs(view []byte, uc *types.UnicityCertifi
 		case confQueued:
 			queued++
 		case confKnown:
-			if remaining.Add(-1) == 0 { // everything was resolved meanwhile: nothing to defer, the callback never runs
-				return false
+			// resolved meanwhile. If it was the last outstanding need: with nothing queued there is nothing to defer (the caller revalidates); with
+			// lookups queued whose callbacks already ran, this registration is what completes the set, so the callback runs now.
+			if remaining.Add(-1) == 0 {
+				if queued == 0 {
+					return false
+				}
+				whenResolved()
+				return true
 			}
 		case confRefused:
 			c.logger.Warn("A stored partition view could not be deferred: shard configuration lookups are at capacity", "shard", n.shard.String())

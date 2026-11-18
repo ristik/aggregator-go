@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
@@ -545,4 +547,72 @@ func Test_Notify_OnlyForInvalidationAndLateMaterial(t *testing.T) {
 	var nilPub *proofpub.Publisher
 	nilPub.SetNotify(func() { t.Fatal("nil publisher") })
 	nilPub.InvalidateLatest(nil)
+}
+
+// ---- deferred stored views: publish first, then resolve, then attach, whatever order the resolution finishes in
+
+type flipConfigs struct {
+	known     *atomic.Bool
+	syncRun   bool // run the callback during registration, before PendingViewConfigs returns
+	reportNo  bool // the last dependency became known while registering: report that nothing is pending
+	callbacks atomic.Int32
+}
+
+func (c *flipConfigs) PendingViewConfigs(_ []byte, _ *types.UnicityCertificate, _ types.SealVerifier, whenResolved func()) bool {
+	c.known.Store(true)
+	if c.reportNo {
+		return false
+	}
+	c.callbacks.Add(1)
+	if c.syncRun {
+		whenResolved()
+	} else {
+		go whenResolved()
+	}
+	return true
+}
+
+func TestADeferredViewIsAttachedWhateverOrderTheResolutionFinishesIn(t *testing.T) {
+	for name, cfg := range map[string]*flipConfigs{
+		"callback before the registration returns": {syncRun: true},
+		"callback after": {},
+		"the last dependency became known while registering": {reportNo: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var known atomic.Bool
+			cfg.known = &known
+			base := prooftest.New(t, 2, 1, prooftest.Hash("x"), 80)
+			e := newEnv(t, base)
+			root := commit(t, e.b, 1, 0, 20)
+			order, err := types.CanonicalShardOrder(prooftest.New(t, 2, 1, root, 80).Topo.Scheme)
+			require.NoError(t, err)
+			changed := prooftest.Hash("the successor configuration of shard 0")
+			f := prooftest.NewWithConfs(t, prooftest.Partition, 2, 1, root, 80, map[string][]byte{order[0].Key(): changed})
+			ucBytes, err := types.Cbor.Marshal(f.UC)
+			require.NoError(t, err)
+			block := models.NewBlock(api.NewBigIntFromUint64(1), "unicity", 0, "1.0", "mainnet", api.NewHexBytes(root), api.NewHexBytes(prooftest.Hash("prev")), api.NewHexBytes(ucBytes), 1)
+			block.Finalized = true
+			block.PartitionView = api.NewHexBytes(f.Raw)
+
+			// the operator's pin of shard 0 is the old configuration and follows; a hash is accepted once the resolver says it knows it
+			pins := base.Provider(t)
+			pins.SetFollowing(map[string]bool{order[0].Key(): true})
+			pins.SetKnown(func(types.ShardID, []byte) bool { return known.Load() })
+			log, err := logger.New("error", "json", "", false)
+			require.NoError(t, err)
+			pub := proofpub.New(e.cat, e.b, pins, log)
+			pub.SetSealVerifier(f.Verifier())
+			pub.SetViewConfigs(cfg)
+
+			pub.EnsurePublishedAtStartup(t.Context(), block)
+			require.Eventually(t, func() bool {
+				l, err := e.cat.AcquireLatest(t.Context())
+				if err != nil {
+					return false
+				}
+				defer l.Release()
+				return bytes.Equal(l.PartitionView(), f.Raw)
+			}, 5*time.Second, 5*time.Millisecond, "the sidecar is attached to the block that was published first")
+		})
+	}
 }

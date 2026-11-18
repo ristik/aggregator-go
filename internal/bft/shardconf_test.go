@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1016,8 +1017,8 @@ func TestARestartResolvesTheFinalizedBlocksConfigurationsFromTheBlockItself(t *t
 			require.Nil(t, lease.PartitionView(), "published without the sidecar until its configurations resolve")
 			lease.Release()
 
-			fl.process(ctx) // the existing worker, the seal-verified path
 			require.Eventually(t, func() bool {
+				fl.process(ctx) // the existing worker, the seal-verified path (the publisher queues the lookups just after publishing the block)
 				l, err := cat.AcquireLatest(ctx)
 				if err != nil {
 					return false
@@ -1026,5 +1027,88 @@ func TestARestartResolvesTheFinalizedBlocksConfigurationsFromTheBlockItself(t *t
 				return bytes.Equal(l.PartitionView(), after.Raw)
 			}, 5*time.Second, 10*time.Millisecond, "the sidecar is attached once the configurations resolve")
 		})
+	}
+}
+
+// The worker runs by itself on the first lookup, for the life of the process: a passive HA replica needs no activation.
+func TestTheWorkerStartsOnTheFirstLookupWithoutActivation(t *testing.T) {
+	f := newFollowFixture(t)
+	fl := f.c.follow
+	fl.autostart = true
+	fl.source = &instantSource{pdr: f.pdr1}
+	done := make(chan struct{})
+	require.Equal(t, confQueued, fl.request(types.ShardID{}, f.h1, []uint64{1}, &confCallback{fn: func() { close(done) }}))
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the callback of a lookup was never run: no worker")
+	}
+}
+
+// Expiry is not resolution: a lookup a durable view's callback waits for outlives the TTL, is retried with its backoff, and runs the callback
+// only when its configuration is actually known.
+func TestExpiryIsNotResolutionForADurableViewsCallback(t *testing.T) {
+	f := newFollowFixture(t)
+	fl := f.c.follow
+	now := time.Unix(1000, 0)
+	fl.now = func() time.Time { return now }
+	f.srv.fail = errors.New("source down")
+	var ran atomic.Int32
+	require.Equal(t, confQueued, fl.request(types.ShardID{}, f.h1, []uint64{1}, &confCallback{fn: func() { ran.Add(1) }}))
+	replay := &certification.CertificationResponse{Partition: utbtest.Partition}
+	require.Equal(t, confQueued, fl.request(types.ShardID{}, f.h1, []uint64{1}, replay))
+	fl.process(context.Background())
+	// a ten minute outage
+	now = now.Add(confPendingTTL + time.Second)
+	fl.process(context.Background())
+	require.Zero(t, ran.Load(), "expiry did not run the callback")
+	require.Len(t, fl.pending, 1, "the lookup the durable view waits for is retained")
+	select {
+	case got := <-f.c.reinject:
+		require.Same(t, replay, got, "while a response to replay is handed back")
+	default:
+		t.Fatal("the response to replay was not handed back")
+	}
+	// the source recovers: the retry (after its backoff) resolves it and only then does the callback run
+	f.srv.fail = nil
+	now = now.Add(confBackoffMax + time.Second)
+	fl.process(context.Background())
+	require.Eventually(t, func() bool { return ran.Load() == 1 }, 2*time.Second, 5*time.Millisecond)
+	require.Empty(t, fl.pending)
+}
+
+// With two needed configurations, the first can resolve before the second is found to be known already: the registration that completes
+// the set must run the callback (it used to report "nothing pending" and the view was dropped although every configuration was known).
+func TestAViewWithTwoNeedsAlwaysCompletesItsCallback(t *testing.T) {
+	root := prooftest.Hash("root-1")
+	before := prooftest.New(t, 2, 7, root, 80)
+	order, err := types.CanonicalShardOrder(before.Topo.Scheme)
+	require.NoError(t, err)
+	ours, sibling := order[0], order[1]
+	mk := func(shard types.ShardID, epoch uint64) *types.PartitionDescriptionRecord {
+		return &types.PartitionDescriptionRecord{Version: 1, NetworkID: prooftest.NetworkID, PartitionID: prooftest.Partition, PartitionTypeID: 7, TypeIDLen: 8, UnitIDLen: 256,
+			ShardID: shard, T2Timeout: time.Second, Epoch: epoch, EpochStart: 1 + epoch*100,
+			Validators: []*types.NodeInfo{{NodeID: "n", SigKey: []byte{2, 1}, Stake: 1}}}
+	}
+	ours0, ours1, sib1 := mk(ours, 0), mk(ours, 1), mk(sibling, 1)
+	after := prooftest.NewWithConfs(t, prooftest.Partition, 2, 8, root, 90, map[string][]byte{ours.Key(): confHashOf(t, ours1), sibling.Key(): confHashOf(t, sib1)})
+	for i := 0; i < 200; i++ {
+		c, _ := newProofClient(t, &stubRoundManager{}, before)
+		c.shardID = ours
+		topo := c.proofTopology.(*proofmaterial.StaticTopology)
+		topo.SetFollowing(map[string]bool{ours.Key(): true, sibling.Key(): true})
+		src := &confServer{byEpoch: map[string]map[uint64]*types.PartitionDescriptionRecord{ours.Key(): {1: ours1}, sibling.Key(): {1: sib1}}}
+		fl := newShardConfFollower(src, ours0, before.Topo.ShardConfHashes[ours.Key()])
+		fl.autostart = true
+		fl.deliver = c.redeliver
+		c.follow = fl
+		c.authn.withShardConfFollower(fl, before.Topo.ShardConfHashes[ours.Key()])
+		c.followTopology()
+		var ran atomic.Int32
+		pending := c.PendingViewConfigs(after.Raw, after.UC, before.Verifier()(context.Background()), func() { ran.Add(1) })
+		require.True(t, pending, "round %d: both configurations are unknown at first", i)
+		require.Eventually(t, func() bool { return ran.Load() >= 1 }, 5*time.Second, time.Millisecond, "round %d: the callback never ran", i)
+		time.Sleep(time.Millisecond)
+		require.EqualValues(t, 1, ran.Load(), "round %d: exactly once", i)
 	}
 }

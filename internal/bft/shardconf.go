@@ -92,6 +92,10 @@ type shardConfFollower struct {
 	needed      map[string][]byte                                       // the configuration hash of each shard in the latest accepted view
 	neededRound uint64                                                  // the root round of the certificate that view belongs to
 	wake        chan struct{}
+	// autostart runs the worker (once, for the life of the process) on the first registered lookup: a passive HA replica serving the stored
+	// certification needs its sidecar configurations resolved without being activated
+	autostart  bool
+	workerOnce sync.Once
 	// deliver hands a deferred response back to the message loop with a non-blocking send; it reports whether it was taken (the channel may be full)
 	deliver func(any) bool
 
@@ -203,7 +207,11 @@ func (f *shardConfFollower) request(shard types.ShardID, sealed []byte, hints []
 	}
 	f.pending[key] = l
 	due := !l.next.After(now)
+	autostart := f.autostart
 	f.mu.Unlock()
+	if autostart {
+		f.workerOnce.Do(func() { go f.run(context.Background()) })
+	}
 	if due {
 		select {
 		case f.wake <- struct{}{}:
@@ -237,12 +245,27 @@ func (f *shardConfFollower) reclaimLocked(local bool) bool {
 // It acts on the registered lookup it found, so a fresh lookup registered later under the same key is untouched.
 func (f *shardConfFollower) expireLocked(now time.Time) {
 	for k, l := range f.pending {
-		if now.Sub(l.born) > confPendingTTL {
-			f.ready = append(f.ready, l.waiters...)
-			l.waiters = nil
-			if f.pending[k] == l {
-				delete(f.pending, k)
+		if now.Sub(l.born) <= confPendingTTL {
+			continue
+		}
+		// Expiry is not resolution. A lookup that a durable view's callback waits for is retained, and retried with its backoff, until its
+		// configuration is known (it is no longer wanted when its block is superseded: the callback then finds nothing to attach to). Responses to
+		// replay are handed back: the message loop verifies them again and queues a fresh lookup if still needed.
+		var keep []any
+		for _, w := range l.waiters {
+			if _, isCallback := w.(*confCallback); isCallback {
+				keep = append(keep, w)
+			} else {
+				f.ready = append(f.ready, w)
 			}
+		}
+		l.waiters = keep
+		if len(keep) > 0 {
+			l.born = now
+			continue
+		}
+		if f.pending[k] == l {
+			delete(f.pending, k)
 		}
 	}
 }
