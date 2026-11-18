@@ -1,11 +1,19 @@
 package bft
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"github.com/unicitynetwork/aggregator-go/internal/logger"
+	"github.com/unicitynetwork/aggregator-go/internal/models"
+	"github.com/unicitynetwork/aggregator-go/internal/proofpub"
+	"github.com/unicitynetwork/aggregator-go/internal/proofview"
+	"github.com/unicitynetwork/aggregator-go/internal/smt"
+	smtbackend "github.com/unicitynetwork/aggregator-go/internal/smt/backend"
+	"github.com/unicitynetwork/aggregator-go/pkg/api"
 	"os"
 	"path/filepath"
 	"sync"
@@ -923,4 +931,100 @@ func TestAnExpiredResponseIsNotRefusedAgainstItsOwnSlot(t *testing.T) {
 	fl.flush()
 	wg.Wait()
 	require.Equal(t, confQueued, <-results, "its own slot was released with the delivery")
+}
+
+// A restart: the durable finalized block and its UC are the source of truth. Whatever the cache file holds (nothing, or the dependencies of a
+// different, newer view because a round was started without finalizing, or a block was finalized and the next round failed to start), the
+// publisher resolves the configurations the block's sidecar needs through the seal-verified worker and attaches the sidecar when they resolve.
+func TestARestartResolvesTheFinalizedBlocksConfigurationsFromTheBlockItself(t *testing.T) {
+	for name, cache := range map[string]string{"no cache": "", "cache of a newer view": "newer", "cache of an older view": "older"} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			backend := smtbackend.NewMemoryBackend(smt.NewThreadSafeSMT(smt.NewSparseMerkleTree(api.SHA256, api.StateTreeKeyLengthBits)))
+			snap, err := backend.CreateSnapshot(ctx)
+			require.NoError(t, err)
+			key := make([]byte, api.StateTreeKeyLengthBytes)
+			key[0] = 7
+			res, err := snap.AddLeavesClassified(ctx, []smtbackend.LeafInput{{Key: key, Value: make([]byte, 32)}})
+			require.NoError(t, err)
+			require.NoError(t, snap.Commit(ctx, smtbackend.CommitMetadata{BlockNumber: api.NewBigIntFromUint64(5), RootHash: res.CandidateRoot}))
+			root := res.CandidateRoot
+
+			before := prooftest.New(t, 2, 7, root, 80)
+			order, err := types.CanonicalShardOrder(before.Topo.Scheme)
+			require.NoError(t, err)
+			ours, sibling := order[0], order[1]
+			node := func(id string) *types.NodeInfo {
+				return &types.NodeInfo{NodeID: id, SigKey: []byte{2, byte(len(id))}, Stake: 1}
+			}
+			mk := func(shard types.ShardID, epoch uint64, ids ...string) *types.PartitionDescriptionRecord {
+				p := &types.PartitionDescriptionRecord{Version: 1, NetworkID: prooftest.NetworkID, PartitionID: prooftest.Partition, PartitionTypeID: 7, TypeIDLen: 8, UnitIDLen: 256,
+					ShardID: shard, T2Timeout: time.Second, Epoch: epoch, EpochStart: 1 + epoch*100}
+				for _, id := range ids {
+					p.Validators = append(p.Validators, node(id))
+				}
+				return p
+			}
+			ours0, ours1, sib1 := mk(ours, 0, "o1"), mk(ours, 1, "o1", "o2"), mk(sibling, 1, "s1", "s2")
+			after := prooftest.NewWithConfs(t, prooftest.Partition, 2, 8, root, 90, map[string][]byte{ours.Key(): confHashOf(t, ours1), sibling.Key(): confHashOf(t, sib1)})
+			ucBytes, err := types.Cbor.Marshal(after.UC)
+			require.NoError(t, err)
+			block := models.NewBlock(api.NewBigIntFromUint64(5), "unicity", 0, "1.0", "mainnet", api.NewHexBytes(root), api.NewHexBytes(prooftest.Hash("prev")), api.NewHexBytes(ucBytes), 1)
+			block.Finalized = true
+			block.PartitionView = api.NewHexBytes(after.Raw)
+
+			// the cache file of the previous process: whatever it holds, the block does not depend on it
+			cp := filepath.Join(t.TempDir(), "checkpoint.json")
+			if cache != "" {
+				other := mk(sibling, 9, "x")
+				raw, err := json.Marshal([]*types.PartitionDescriptionRecord{other})
+				require.NoError(t, err)
+				if cache == "older" {
+					raw, err = json.Marshal([]*types.PartitionDescriptionRecord{mk(sibling, 0, "s0")})
+					require.NoError(t, err)
+				}
+				require.NoError(t, os.WriteFile(cp+".known", raw, 0o600))
+			}
+
+			c, _ := newProofClient(t, &stubRoundManager{}, before)
+			c.shardID = ours
+			topo := c.proofTopology.(*proofmaterial.StaticTopology)
+			topo.SetFollowing(map[string]bool{ours.Key(): true, sibling.Key(): true})
+			src := &confServer{byEpoch: map[string]map[uint64]*types.PartitionDescriptionRecord{ours.Key(): {1: ours1}, sibling.Key(): {1: sib1}}}
+			fl := newShardConfFollower(src, ours0, before.Topo.ShardConfHashes[ours.Key()])
+			fl.checkpoint = cp
+			fl.restoreKnown(cp)
+			fl.deliver = c.redeliver
+			c.follow = fl
+			c.reinject = make(chan any, 4)
+			c.authn.withShardConfFollower(fl, before.Topo.ShardConfHashes[ours.Key()])
+			c.followTopology()
+
+			log, err := logger.New("error", "json", "", false)
+			require.NoError(t, err)
+			cat, err := proofview.NewCatalog(proofview.DefaultLimits())
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = cat.Close() })
+			pub := proofpub.New(cat, backend, c.proofTopology, log)
+			require.NotNil(t, pub)
+			pub.SetSealVerifier(before.Verifier())
+			pub.SetViewConfigs(c)
+
+			pub.EnsurePublishedAtStartup(ctx, block)
+			lease, err := cat.AcquireLatest(ctx)
+			require.NoError(t, err)
+			require.Nil(t, lease.PartitionView(), "published without the sidecar until its configurations resolve")
+			lease.Release()
+
+			fl.process(ctx) // the existing worker, the seal-verified path
+			require.Eventually(t, func() bool {
+				l, err := cat.AcquireLatest(ctx)
+				if err != nil {
+					return false
+				}
+				defer l.Release()
+				return bytes.Equal(l.PartitionView(), after.Raw)
+			}, 5*time.Second, 10*time.Millisecond, "the sidecar is attached once the configurations resolve")
+		})
+	}
 }

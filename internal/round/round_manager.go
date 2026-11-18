@@ -1887,6 +1887,7 @@ func (rm *RoundManager) initProofViews(cfg *config.Config, client *bft.BFTClient
 		return nil
 	}
 	rm.proofPub.SetSealVerifier(client.SealVerifier)
+	rm.proofPub.SetViewConfigs(client)
 	rm.proofPub.SetNotify(rm.notifyWaiters)
 	client.SetProofMaterialSink(rm.proofPub)
 	return nil

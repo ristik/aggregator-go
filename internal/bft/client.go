@@ -1190,12 +1190,78 @@ func (c *BFTClientImpl) SetShardConfSource(src ShardConfSource) {
 // redeliver hands a response that was deferred for its configuration back to the message loop, and reports whether it was taken: a full
 // channel leaves it with the follower, which offers it again on its next pass (it is never dropped for a full channel).
 func (c *BFTClientImpl) redeliver(m any) bool {
+	if cb, ok := m.(*confCallback); ok {
+		go cb.fn() // a resolution a consumer (the proof publisher at startup) waits for: it runs off the follower's mutex
+		return true
+	}
 	select {
 	case c.reinject <- m:
 		return true
 	default:
 		return false
 	}
+}
+
+// confCallback is a waiter that runs a function once its lookup resolves (not a response to replay).
+type confCallback struct{ fn func() }
+
+// PendingViewConfigs implements proofpub.ViewConfigs: the stored view of the durable finalized block is authenticated by its seal first (the
+// pins aside), then every following shard whose leaf commits to a configuration this client has not resolved gets a lookup on the existing
+// worker. It reports whether any was queued; whenResolved runs once, after all of them resolved.
+func (c *BFTClientImpl) PendingViewConfigs(view []byte, uc *types.UnicityCertificate, verifier types.SealVerifier, whenResolved func()) bool {
+	topo, static := c.proofTopology.(*proofmaterial.StaticTopology)
+	if !static || c.follow == nil || verifier == nil {
+		return false
+	}
+	if _, _, err := proofmaterial.ValidateView(view, uc, verifier, nil); err != nil {
+		return false
+	}
+	decoded, err := types.DecodePartitionViewV1(view)
+	if err != nil {
+		return false
+	}
+	type need struct {
+		shard types.ShardID
+		hash  []byte
+		hints []uint64
+	}
+	var needs []need
+	for _, leaf := range decoded.Leaves {
+		pin, ok := topo.Pin(leaf.ShardID)
+		if !ok || !topo.Following(leaf.ShardID) || bytes.Equal(pin, leaf.ShardConfHash) || c.follow.isKnown(leaf.ShardID, leaf.ShardConfHash) {
+			continue
+		}
+		n := need{shard: leaf.ShardID, hash: leaf.ShardConfHash}
+		if leaf.InputRecord != nil {
+			n.hints = []uint64{leaf.InputRecord.Epoch + 1, leaf.InputRecord.Epoch}
+		}
+		needs = append(needs, n)
+	}
+	if len(needs) == 0 {
+		return false
+	}
+	var remaining atomic.Int32
+	remaining.Store(int32(len(needs)))
+	done := func() {
+		if remaining.Add(-1) == 0 {
+			whenResolved()
+		}
+	}
+	queued := 0
+	for _, n := range needs {
+		switch c.follow.request(n.shard, n.hash, n.hints, &confCallback{fn: done}) {
+		case confQueued:
+			queued++
+		case confKnown:
+			if remaining.Add(-1) == 0 { // everything was resolved meanwhile: nothing to defer, the callback never runs
+				return false
+			}
+		case confRefused:
+			c.logger.Warn("A stored partition view could not be deferred: shard configuration lookups are at capacity", "shard", n.shard.String())
+			return false
+		}
+	}
+	return queued > 0
 }
 
 // followTopology connects the pinned consolidation topology (when there is one) to the configurations this client resolved: its shards
@@ -1328,7 +1394,7 @@ func (c *BFTClientImpl) stagePartitionViewOp(ctx context.Context, op *authOp, cr
 	if deferred, refused := c.deferViewForConfigs(cr, op); deferred || refused {
 		// a view that no lookup retained is refused, not pending
 		label := "config_pending"
-		if refused {
+		if refused && !deferred { // a lookup that holds the view hands it back; refused only when none does
 			label = "config_refused"
 		}
 		metrics.BFTPartitionViewTotal.WithLabelValues(label).Inc()

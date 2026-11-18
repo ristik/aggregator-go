@@ -144,7 +144,9 @@ const (
 )
 
 // ErrShardConfBusy reports an authentic certificate (or view) that could not be deferred for lack of capacity: it is refused, not pending,
-// and is reported; the root sends the certificate again (the inactivity recovery asks for it).
+// and is reported. A refused certificate does not advance the shard, so the inactivity recovery asks the root for it again. A refused view
+// belongs to an accepted certificate, so nothing asks again: its sidecar is lost unless another root delivers a duplicate, which is
+// acceptable at capacity because later rounds bring new views.
 var ErrShardConfBusy = errors.New("shard configuration lookups are at capacity")
 
 // backlogLocked is the budget in use: every response is charged from registration until it is actually handed back.
@@ -317,11 +319,9 @@ func (f *shardConfFollower) resolve(ctx context.Context, l *lookup) {
 	f.mu.Lock()
 	hints := append([]uint64(nil), l.hints...)
 	f.mu.Unlock()
-	failed := false
 	for _, epoch := range hints {
 		pdr, err := f.source.ShardConfig(ctx, f.partition, l.shard, epoch)
 		if err != nil {
-			failed = true
 			break // the source is failing: back off rather than spend the budget on the other hints
 		}
 		if pdr == nil {
@@ -334,7 +334,6 @@ func (f *shardConfFollower) resolve(ctx context.Context, l *lookup) {
 		f.complete(l, h, pdr)
 		return
 	}
-	_ = failed
 	f.mu.Lock()
 	l.fails++
 	back := confBackoffFirst << min(l.fails-1, 6)

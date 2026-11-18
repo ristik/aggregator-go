@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/unicitynetwork/bft-go-base/types"
 
@@ -57,6 +58,8 @@ type Publisher struct {
 	log      *logger.Logger
 	// sealVerifier authenticates stored views again (nil: stored views are not republished).
 	sealVerifier func(ctx context.Context) types.SealVerifier
+	// configs resolves the configurations a stored view needs (nil: a view that does not validate is dropped)
+	configs ViewConfigs
 	// notify wakes long-poll waiters after a publication outcome which no finalization path
 	// reports itself: late certification material. Finalization publishes
 	// first and its caller notifies afterwards, once the proof-ready update is done (a wake
@@ -121,6 +124,21 @@ func New(catalog *proofview.Catalog, backend smtbackend.Backend, topology proofm
 		return nil
 	}
 	return &Publisher{catalog: catalog, retainer: retainer, backend: backend, topology: topology, log: log}
+}
+
+// ViewConfigs resolves, through the client's seal-verified lookup path and its single worker, the shard configurations a stored partition view
+// needs under the topology rules (a following pin whose leaf commits to a configuration not resolved yet). It reports whether it queued any
+// resolution; whenResolved is called once, after every one of them resolved.
+type ViewConfigs interface {
+	PendingViewConfigs(view []byte, uc *types.UnicityCertificate, verifier types.SealVerifier, whenResolved func()) bool
+}
+
+// SetViewConfigs makes the publisher resolve the configurations a stored view needs before it publishes the view, instead of dropping a view
+// whose configurations a restarted process has not resolved yet.
+func (p *Publisher) SetViewConfigs(v ViewConfigs) {
+	if p != nil {
+		p.configs = v
+	}
 }
 
 // SetSealVerifier sets the trusted seal verifier used to re-authenticate stored
@@ -303,6 +321,12 @@ func (p *Publisher) revalidatedView(ctx context.Context, block *models.Block, uc
 	if verifier != nil {
 		if _, view, err := proofmaterial.ValidateView(block.PartitionView, uc, verifier, p.topology); err == nil {
 			return view
+		} else if p.configs != nil && p.configs.PendingViewConfigs(block.PartitionView, uc, verifier, func() { p.attachDeferredView(block, uc) }) {
+			// The durable block is the source of truth: the configurations its sidecar needs are resolved from its own seal-verified view, not read
+			// from a cache that may be out of step. The certification is published now without the sidecar; the sidecar is attached when they resolve.
+			metrics.ProofViewPublicationTotal.WithLabelValues("view_deferred").Inc()
+			p.log.WithContext(ctx).Info("Deferring the stored partition view until its shard configurations are resolved", "block", block.Index.String())
+			return nil
 		} else {
 			p.log.WithContext(ctx).Warn("Dropping stored partition view which does not validate against its UC",
 				"block", block.Index.String(), "error", err.Error())
@@ -310,6 +334,34 @@ func (p *Publisher) revalidatedView(ctx context.Context, block *models.Block, uc
 	}
 	metrics.ProofViewPublicationTotal.WithLabelValues("view_dropped").Inc()
 	return nil
+}
+
+// attachDeferredView publishes the stored view of a block once the configurations it needed are resolved: it is validated again under the
+// same rules and attached to the retained state of exactly that block and certification.
+func (p *Publisher) attachDeferredView(block *models.Block, uc *types.UnicityCertificate) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var verifier types.SealVerifier
+	if p.sealVerifier != nil {
+		verifier = p.sealVerifier(ctx)
+	}
+	if verifier == nil {
+		return
+	}
+	_, view, err := proofmaterial.ValidateView(block.PartitionView, uc, verifier, p.topology)
+	if err != nil {
+		p.log.WithContext(ctx).Warn("Dropping stored partition view which does not validate after its configurations resolved", "block", block.Index.String(), "error", err.Error())
+		metrics.ProofViewPublicationTotal.WithLabelValues("view_dropped").Inc()
+		return
+	}
+	id := proofview.BlockIdentity{Number: block.Index, ConfigLineage: append([]byte(nil), uc.ShardConfHash...)}
+	if err := p.catalog.AttachCertification(ctx, id, block.RootHash, proofview.Certification{UC: block.UnicityCertificate, PartitionView: view}); err != nil {
+		p.log.WithContext(ctx).Warn("Could not attach the stored partition view", "block", block.Index.String(), "error", err.Error())
+		metrics.ProofViewPublicationTotal.WithLabelValues(ResultAttachFailed).Inc()
+		return
+	}
+	metrics.ProofViewPublicationTotal.WithLabelValues(ResultAttached).Inc()
+	p.wake()
 }
 
 // PublishProofMaterial implements proofmaterial.Sink: it attaches accepted
