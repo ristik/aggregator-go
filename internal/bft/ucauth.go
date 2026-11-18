@@ -244,6 +244,9 @@ type authOp struct {
 	// confHints are shard epochs an authenticated record names for the shard's configuration (the technical record's epoch): where
 	// the resolution of an unknown configuration hash looks first
 	confHints []uint64
+	// deferred is the response this operation verifies: when its configuration is unknown it is registered with the resolution and handed
+	// back to the message loop once it resolves
+	deferred any
 }
 
 type opEpoch struct {
@@ -332,7 +335,9 @@ func (o *authOp) verifyUC(uc *types.UnicityCertificate, partition types.Partitio
 		if ir := uc.InputRecord; ir != nil {
 			hints = append(hints, ir.Epoch+1, ir.Epoch)
 		}
-		a.follow.request(a.follow.ours, uc.ShardConfHash, hints)
+		if a.follow.request(a.follow.ours, uc.ShardConfHash, hints, o.deferred) {
+			return nil // resolved in the meantime: the certificate verifies against the configuration it commits to
+		}
 		return fmt.Errorf("%w: the certificate commits to configuration %X", ErrShardConfPending, uc.ShardConfHash)
 	}
 	return nil

@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
-	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -85,23 +83,29 @@ func TestBFTRestClient_GetTrustBases(t *testing.T) {
 func TestShardConfigAsksForTheShardAndEpochAndDecodesTheAnswer(t *testing.T) {
 	left, right := types.ShardID{}.Split()
 	leftText, _ := left.MarshalText()
-	var query []url.Values
+	type request struct {
+		Partition uint32 `json:"partition"`
+		Shard     string `json:"shard"`
+		Epoch     uint64 `json:"epoch"`
+	}
+	var asked []request
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.Equal(t, "/api/v1/shardConf", r.URL.Path)
-		require.Equal(t, http.MethodGet, r.Method)
-		q := r.URL.Query()
-		query = append(query, q)
+		require.Equal(t, "/api/v1/q3/shard-conf", r.URL.Path)
+		require.Equal(t, http.MethodPost, r.Method)
+		require.Equal(t, "application/json", r.Header.Get("Content-Type"))
+		require.Empty(t, r.Header.Get("Origin"))
+		var q request
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&q))
+		asked = append(asked, q)
 		var shard types.ShardID
-		if s := q.Get("shard"); s != "" {
-			require.NoError(t, shard.UnmarshalText([]byte(s)))
+		if q.Shard != "" {
+			require.NoError(t, shard.UnmarshalText([]byte(q.Shard)))
 		}
 		if !shard.Equal(left) && shard.Length() != 0 {
-			http.NotFound(w, r)
+			http.Error(w, "no configuration", http.StatusUnprocessableEntity)
 			return
 		}
-		epoch, _ := strconv.ParseUint(q.Get("epoch"), 10, 64)
-		part, _ := strconv.ParseUint(q.Get("partition"), 10, 32)
-		require.NoError(t, json.NewEncoder(w).Encode(&types.PartitionDescriptionRecord{Version: 1, NetworkID: 5, PartitionID: types.PartitionID(part), ShardID: shard, Epoch: epoch}))
+		require.NoError(t, json.NewEncoder(w).Encode(&types.PartitionDescriptionRecord{Version: 1, NetworkID: 5, PartitionID: types.PartitionID(q.Partition), ShardID: shard, Epoch: q.Epoch}))
 	}))
 	defer srv.Close()
 	c := NewBFTRestClient(srv.URL)
@@ -110,14 +114,26 @@ func TestShardConfigAsksForTheShardAndEpochAndDecodesTheAnswer(t *testing.T) {
 	require.EqualValues(t, 3, pdr.Epoch)
 	require.EqualValues(t, 7, pdr.PartitionID)
 	require.True(t, pdr.ShardID.Equal(left))
-	require.Equal(t, string(leftText), query[0].Get("shard"), "the shard id is passed through")
+	require.Equal(t, request{7, string(leftText), 3}, asked[0], "the shard id is passed through")
 
 	pdr, err = c.ShardConfig(context.Background(), 7, types.ShardID{}, 1)
 	require.NoError(t, err)
 	require.Zero(t, pdr.ShardID.Length())
-	require.False(t, query[1].Has("shard"), "the unsplit shard sends none")
+	require.Empty(t, asked[1].Shard, "the unsplit shard sends none")
 
 	pdr, err = c.ShardConfig(context.Background(), 7, right, 1)
 	require.NoError(t, err)
 	require.Nil(t, pdr, "a configuration the root does not hold is none, not an error")
+
+	absent := httptest.NewServer(http.NotFoundHandler()) // a root without the route at all
+	defer absent.Close()
+	_, err = NewBFTRestClient(absent.URL).ShardConfig(context.Background(), 7, left, 1)
+	require.Error(t, err, "a 404 means the route is absent: it is never read as a missing epoch")
+
+	refuse := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not an operator source", http.StatusForbidden)
+	}))
+	defer refuse.Close()
+	_, err = NewBFTRestClient(refuse.URL).ShardConfig(context.Background(), 7, left, 1)
+	require.Error(t, err, "a refused source is an error, not an absent configuration")
 }

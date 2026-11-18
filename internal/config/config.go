@@ -350,6 +350,10 @@ type BFTConfig struct {
 type ConsolidationShard struct {
 	ShardID    types.ShardID `json:"shardId"`
 	ConfigHash string        `json:"configHash"` // hex SHA-256 of the shard's PartitionDescriptionRecord
+	// Follow marks the pin as following: after a live configuration change (validator-registry kind 6 or 8) the seal-authenticated hash of a
+	// configuration this client resolved for the shard replaces the pin. Without it the pin is fixed: a view that commits to any other
+	// configuration is not validated, and the operator updates the topology file.
+	Follow bool `json:"follow,omitempty"`
 }
 
 // UTBConfig is the signed trust-base history of a deployment whose roots publish signed entries. It is enabled by the pinned genesis EntryID; the shipped

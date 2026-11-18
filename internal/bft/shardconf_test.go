@@ -100,8 +100,14 @@ func (f *followFixture) cert(t *testing.T, conf []byte) *types.UnicityCertificat
 }
 
 func (f *followFixture) verify(uc *types.UnicityCertificate, hints ...uint64) error {
+	return f.verifyDeferred(uc, nil, hints...)
+}
+
+// verifyDeferred is verify for the response cr, which the lookup it queues keeps until it is handed back.
+func (f *followFixture) verifyDeferred(uc *types.UnicityCertificate, cr any, hints ...uint64) error {
 	op := f.c.authn.beginIntake(context.Background())
 	op.confHints = hints
+	op.deferred = cr
 	return op.verifyUC(uc, utbtest.Partition, types.ShardID{})
 }
 
@@ -191,6 +197,7 @@ func TestAResolutionIsBackedOffCoalescedAndDoesNotBlock(t *testing.T) {
 	require.Len(t, f.srv.calls, 2)
 	now = now.Add(time.Hour)
 	f.srv.fail = nil
+	require.ErrorIs(t, f.verify(uc), ErrShardConfPending, "an obsolete lookup was reclaimed; the certificate queues it again")
 	f.resolve()
 	require.NoError(t, f.verify(uc), "the source recovered: the configuration is resolved")
 }
@@ -209,8 +216,7 @@ func TestASlowSourceCannotStallTheResolutionBudget(t *testing.T) {
 func TestTheResolvedCertificateIsHandedBackToTheMessageLoop(t *testing.T) {
 	f := newFollowFixture(t)
 	cr := &certification.CertificationResponse{Partition: utbtest.Partition}
-	f.c.pendingConf.Store(cr)
-	require.ErrorIs(t, f.verify(f.cert(t, f.h1)), ErrShardConfPending)
+	require.ErrorIs(t, f.verifyDeferred(f.cert(t, f.h1), cr), ErrShardConfPending)
 	f.resolve()
 	select {
 	case got := <-f.c.reinject:
@@ -218,6 +224,110 @@ func TestTheResolvedCertificateIsHandedBackToTheMessageLoop(t *testing.T) {
 	default:
 		t.Fatal("the dropped certificate is re-admitted once its configuration is resolved")
 	}
+}
+
+// The production ordering: the worker runs concurrently and may finish the lookup at once, so the response must be registered with the lookup
+// before the worker is woken. Every deferred response of many racing intakes comes back.
+func TestADeferredResponseIsNeverLostToARacingWorker(t *testing.T) {
+	f := newFollowFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.c.reinject = make(chan any, 1024)
+	f.c.follow.deliver = f.c.redeliver
+	src := &instantSource{pdr: f.pdr1}
+	f.c.follow.source = src
+	go f.c.follow.run(ctx)
+	for i := 0; i < 200; i++ {
+		// a fresh follower state each round: forget the configuration so the lookup is queued again
+		f.c.follow.mu.Lock()
+		delete(f.c.follow.known[types.ShardID{}.Key()], string(f.h1))
+		f.c.follow.mu.Unlock()
+		cr := &certification.CertificationResponse{Partition: utbtest.Partition, Status: uint32(i)}
+		tr := sha256.Sum256([]byte("technical record"))
+		err := f.verifyDeferred(utbtest.CertificateWithConf(t, 5, 2, 160, f.signers, tr[:], f.h1), cr)
+		if err == nil {
+			continue // the lookup finished before the response was registered: it verifies now, nothing is deferred
+		}
+		require.ErrorIs(t, err, ErrShardConfPending)
+		select {
+		case got := <-f.c.reinject:
+			require.Same(t, cr, got)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("round %d: the deferred response was lost", i)
+		}
+	}
+}
+
+type instantSource struct {
+	pdr *types.PartitionDescriptionRecord
+}
+
+func (s *instantSource) ShardConfig(context.Context, types.PartitionID, types.ShardID, uint64) (*types.PartitionDescriptionRecord, error) {
+	return s.pdr, nil
+}
+
+// A full reinjection channel never drops a resolved response: the follower keeps it and offers it again.
+func TestAResolvedResponseIsKeptWhileTheLoopIsBusy(t *testing.T) {
+	f := newFollowFixture(t)
+	f.c.reinject = make(chan any, 1)
+	f.c.reinject <- "busy"
+	cr := &certification.CertificationResponse{Partition: utbtest.Partition}
+	require.ErrorIs(t, f.verifyDeferred(f.cert(t, f.h1), cr), ErrShardConfPending)
+	f.resolve()
+	require.Len(t, f.c.follow.ready, 1, "not taken: kept")
+	require.Equal(t, "busy", <-f.c.reinject)
+	f.resolve()
+	require.Same(t, cr, <-f.c.reinject)
+	require.Empty(t, f.c.follow.ready)
+}
+
+func TestPendingResolutionsAreReclaimedAndTheLocalShardHasPriority(t *testing.T) {
+	f := newFollowFixture(t)
+	now := time.Unix(1000, 0)
+	fl := f.c.follow
+	fl.now = func() time.Time { return now }
+	left, _ := types.ShardID{}.Split()
+	for i := 0; i < maxPendingConfs; i++ {
+		fl.request(left, []byte{byte(i), 1}, nil, nil) // siblings that never resolve
+		now = now.Add(time.Second)
+	}
+	require.Len(t, fl.pending, maxPendingConfs)
+	fl.request(left, []byte("one more sibling"), nil, nil)
+	require.Len(t, fl.pending, maxPendingConfs, "a sibling does not displace anything")
+	// the local shard's current progress has priority: it evicts the oldest sibling
+	require.ErrorIs(t, f.verify(f.cert(t, f.h1)), ErrShardConfPending)
+	require.Len(t, fl.pending, maxPendingConfs)
+
+	require.NotContains(t, fl.pending, left.Key()+"/"+string([]byte{0, 1}), "the oldest sibling was reclaimed")
+	require.Contains(t, fl.pending, types.ShardID{}.Key()+"/"+string(f.h1))
+	// obsolete resolutions expire
+	now = now.Add(confPendingTTL + time.Second)
+	fl.process(context.Background())
+	require.Empty(t, fl.pending, "unresolved for longer than the TTL: reclaimed")
+}
+
+func TestAFailedCheckpointSaveIsRetried(t *testing.T) {
+	f := newFollowFixture(t)
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "blocker")
+	require.NoError(t, os.WriteFile(blocker, []byte("x"), 0o600))
+	f.c.follow.checkpoint = filepath.Join(blocker, "sub", "checkpoint.json") // its parent cannot be created
+	now := time.Unix(1000, 0)
+	f.c.follow.now = func() time.Time { return now }
+	second := f.cert(t, f.h2)
+	require.ErrorIs(t, f.verify(second, 2), ErrShardConfPending)
+	f.resolve()
+	f.c.publishConf(second)
+	require.NotNil(t, f.c.follow.unsaved, "the failed save is remembered")
+	// the obstacle goes away: the worker retries after the retry interval and persists it
+	require.NoError(t, os.Remove(blocker))
+	f.resolve()
+	require.NotNil(t, f.c.follow.unsaved, "not before the retry interval")
+	now = now.Add(checkpointRetry + time.Second)
+	f.resolve()
+	require.Nil(t, f.c.follow.unsaved)
+	_, err := os.Stat(f.c.follow.checkpoint)
+	require.NoError(t, err, "the parent directory is created")
 }
 
 func TestASuccessorIsOnlyResolvedFromAnAuthenticatedCertificate(t *testing.T) {
@@ -257,6 +367,7 @@ func TestAServedConfigurationMustHashToTheSealedValue(t *testing.T) {
 	try(&wrongEpoch, confHashOf(t, &wrongEpoch))
 	f.srv.byEpoch[whole] = map[uint64]*types.PartitionDescriptionRecord{1: f.pdr1}
 	now = now.Add(time.Hour)
+	require.ErrorIs(t, f.verify(f.cert(t, f.h1)), ErrShardConfPending)
 	f.resolve()
 	require.NoError(t, f.verify(f.cert(t, f.h1)), "the right one resolves")
 }
@@ -339,41 +450,69 @@ func TestASplitShardAndItsSiblingsFollowAKind6Boundary(t *testing.T) {
 	rm := &stubRoundManager{}
 	c, _ := newProofClient(t, rm, before)
 	c.shardID = ours
+	topo := c.proofTopology.(*proofmaterial.StaticTopology)
 	startHash := before.Topo.ShardConfHashes[ours.Key()]
 	f := newShardConfFollower(src, ours0, startHash)
 	c.follow = f
-	c.reinject = make(chan any, 4)
+	c.reinject = make(chan any, 16)
+	f.deliver = c.redeliver
 	c.authn.withShardConfFollower(f, startHash)
+	c.followTopology()
 
 	// the certificate of the split shard after the boundary: authentic, configuration unknown; resolved for OUR shard (not the whole partition)
 	require.ErrorIs(t, c.authn.beginIntake(context.Background()).verifyUC(after.UC, prooftest.Partition, ours), ErrShardConfPending)
-	// the view of the same response is deferred until both changed shards are resolved, and requests the sibling's configuration too
 	cr := response(after, after.Raw)
+
+	// FIXED pins (the default): the operator's pin is never replaced and no lookup is made for the view; it is only proof material
+	c.stagePartitionView(t.Context(), cr)
+	require.Zero(t, c.proofStaging.Len(), "a view that commits to another configuration than a fixed pin is not staged")
+	require.Len(t, f.pending, 1, "only the certificate's own lookup is queued: a fixed pin asks for nothing")
+	_, _, err = proofmaterial.ValidateView(cr.PartitionView, &cr.UC, c.authn.sealVerifier(context.Background()), topo)
+	require.Error(t, err, "and a stored view fails the same rule on revalidation")
+
+	// FOLLOWING pins: the view is deferred until the changed shards are resolved, and registered with their lookups so it is handed back
+	topo.SetFollowing(map[string]bool{ours.Key(): true, sibling.Key(): true})
 	c.stagePartitionView(t.Context(), cr)
 	require.Zero(t, c.proofStaging.Len(), "a view with unresolved configurations is deferred")
+	require.Len(t, f.pending, 2, "the sibling's configuration is queued too")
 	f.process(context.Background())
 	require.ElementsMatch(t, []string{ours.Key() + "@2", ours.Key() + "@1", sibling.Key() + "@2", sibling.Key() + "@1"}, src.calls,
 		"each shard is asked for its own history, input record epoch + 1 first (the record's epoch here is 1)")
 	require.True(t, f.isKnown(ours, ourH1))
 	require.True(t, f.isKnown(sibling, sibH1))
 	require.False(t, f.isKnown(other, sibH1), "a configuration of one shard is not known for another")
+	select {
+	case got := <-c.reinject:
+		require.Same(t, cr, got, "the sidecar is retained for retry and handed back once the sibling is resolved")
+	default:
+		t.Fatal("the deferred view was not handed back")
+	}
 
-	// the certificate and the view now validate across the boundary, against the operator's pins moved only for the resolved shards
+	// the certificate and the view now validate across the boundary, in live intake and on revalidation alike
 	require.NoError(t, c.authn.beginIntake(context.Background()).verifyUC(after.UC, prooftest.Partition, ours))
 	c.stagePartitionView(t.Context(), cr)
 	require.Equal(t, 1, c.proofStaging.Len(), "the sharded view validates across the boundary")
-	pins, _ := c.proofTopology.(*proofmaterial.StaticTopology).Topology(prooftest.Partition)
+	_, _, err = proofmaterial.ValidateView(cr.PartitionView, &cr.UC, c.authn.sealVerifier(context.Background()), topo)
+	require.NoError(t, err, "a stored view is revalidated under the same rule")
+	pins, _ := topo.Topology(prooftest.Partition)
 	require.Equal(t, before.Topo.ShardConfHashes[ours.Key()], pins.ShardConfHashes[ours.Key()], "the operator's topology is not modified")
+
+	// a shard that is not marked as following stays fixed even when its configuration is known
+	topo.SetFollowing(map[string]bool{ours.Key(): true})
+	_, _, err = proofmaterial.ValidateView(cr.PartitionView, &cr.UC, c.authn.sealVerifier(context.Background()), topo)
+	require.Error(t, err, "the sibling's pin is fixed")
 
 	// a view whose changed shard serves nothing that hashes to the sealed value is never staged
 	c2, _ := newProofClient(t, rm, before)
 	c2.shardID = ours
+	topo2 := c2.proofTopology.(*proofmaterial.StaticTopology)
+	topo2.SetFollowing(map[string]bool{ours.Key(): true, sibling.Key(): true})
 	f2 := newShardConfFollower(&confServer{byEpoch: map[string]map[uint64]*types.PartitionDescriptionRecord{}}, ours0, startHash)
 	c2.follow = f2
 	c2.authn.withShardConfFollower(f2, startHash)
+	c2.followTopology()
 	c2.stagePartitionView(t.Context(), cr)
 	f2.process(context.Background())
 	c2.stagePartitionView(t.Context(), cr)
 	require.Zero(t, c2.proofStaging.Len())
-	_ = ours0
 }

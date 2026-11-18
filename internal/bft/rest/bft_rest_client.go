@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -67,35 +68,39 @@ func (c *BFTRestClient) GetTrustBases(ctx context.Context, fromEpoch, toEpoch ui
 	return response.TrustBases, nil
 }
 
-// ShardConfig asks the root for the configuration of one epoch of a shard (GET /api/v1/shardConf, which is public and shard-aware). The
-// answer is untrusted: the caller checks its hash against the one the root seal committed to.
+// ShardConfig asks the root for the configuration of one epoch of a shard (POST /api/v1/q3/shard-conf, the shard-aware read behind `ubft q3
+// shard-conf`). That endpoint answers loopback peers only (the root's operator sources), so the aggregator reads it over the root's loopback RPC
+// address, which it shares a network namespace with; there is deliberately no public variant. The answer is untrusted: the caller checks its
+// hash against the one the root seal committed to. A configuration the root does not hold is (nil, nil).
 func (c *BFTRestClient) ShardConfig(ctx context.Context, partition types.PartitionID, shard types.ShardID, epoch uint64) (*types.PartitionDescriptionRecord, error) {
-	shardText, err := shard.MarshalText()
+	req := struct {
+		Partition uint32 `json:"partition"`
+		Shard     string `json:"shard,omitempty"`
+		Epoch     uint64 `json:"epoch"`
+	}{Partition: uint32(partition), Epoch: epoch}
+	if shard.Length() > 0 {
+		text, err := shard.MarshalText()
+		if err != nil {
+			return nil, err
+		}
+		req.Shard = string(text)
+	}
+	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
-	u, err := url.Parse(c.baseURL + "/api/v1/shardConf")
-	if err != nil {
-		return nil, fmt.Errorf("invalid base URL: %w", err)
-	}
-	q := u.Query()
-	q.Set("partition", strconv.FormatUint(uint64(partition), 10))
-	q.Set("epoch", strconv.FormatUint(epoch, 10))
-	if shard.Length() > 0 {
-		q.Set("shard", string(shardText))
-	}
-	u.RawQuery = q.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/q3/shard-conf", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	resp, err := c.httpClient.Do(req)
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil
+	if resp.StatusCode == http.StatusUnprocessableEntity {
+		return nil, nil // the endpoint's answer for a configuration it does not hold
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("unexpected HTTP status: %s", resp.Status)
