@@ -26,6 +26,7 @@ import (
 	cryptobft "github.com/unicitynetwork/bft-go-base/crypto"
 	"github.com/unicitynetwork/bft-go-base/types"
 
+	"github.com/unicitynetwork/aggregator-go/internal/bft/rest"
 	"github.com/unicitynetwork/aggregator-go/internal/config"
 	"github.com/unicitynetwork/aggregator-go/internal/events"
 	"github.com/unicitynetwork/aggregator-go/internal/logger"
@@ -208,6 +209,11 @@ func NewBFTClient(
 		return nil, fmt.Errorf("invalid consolidation topology: %w", err)
 	}
 	bftClient.proofTopology = topo
+	if conf.RPCAddress != "" {
+		// the shard's configuration changes live (validator-registry kinds 6 and 8): successors are fetched from the root and checked against
+		// the hash its seal committed to
+		bftClient.SetShardConfSource(rest.NewBFTRestClient(conf.RPCAddress))
+	}
 	bftClient.status.Store(idle)
 	bftClient.luc.Store(luc)
 	bftClient.lastCertResponseTime.Store(time.Now().UnixMilli())
@@ -1100,6 +1106,24 @@ func (c *BFTClientImpl) noteAuthenticated(ctx context.Context, uc *types.Unicity
 		c.logger.WithContext(ctx).Warn("failed to republish the admitted root peers, will retry", "error", err.Error())
 		c.catchup.RetryLater(time.Second)
 	}
+}
+
+// SetShardConfSource makes the client follow the shard's configuration across a live change (validator-registry kinds 6 and 8): a
+// certificate that authenticates and commits to a successor configuration is accepted once the source serves a successor that hashes to
+// the sealed value, and the consolidation topology pin of this shard follows it. Without a source the client keeps verifying against the
+// configuration it started with. Call before Start.
+func (c *BFTClientImpl) SetShardConfSource(src ShardConfSource) {
+	if src == nil || c.conf == nil || c.conf.ShardConf == nil {
+		return
+	}
+	f := newShardConfFollower(src, c.conf.ShardConf)
+	f.onAdopt = func(previous, adopted []byte) {
+		if t, ok := c.proofTopology.(*proofmaterial.StaticTopology); ok && t.Follow(c.shardID, previous, adopted) {
+			c.logger.Info("Consolidation topology pin of this shard follows its new configuration", "configHash", hex.EncodeToString(adopted))
+		}
+		c.logger.Info("Shard configuration changed", "configHash", hex.EncodeToString(adopted))
+	}
+	c.authn.withShardConfFollower(f, c.authn.currentConfHash())
 }
 
 // ProofTopology returns the optional independently pinned topology (nil: none configured).

@@ -2,6 +2,7 @@ package rest
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -77,4 +78,24 @@ func TestBFTRestClient_GetTrustBases(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestShardConfigPostsThePartitionAndEpochAndDecodesTheAnswer(t *testing.T) {
+	var got struct {
+		Partition uint32 `json:"partition"`
+		Epoch     uint64 `json:"epoch"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/api/v1/q3/shard-conf", r.URL.Path)
+		require.Equal(t, http.MethodPost, r.Method)
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+		pdr := &types.PartitionDescriptionRecord{Version: 1, NetworkID: 5, PartitionID: types.PartitionID(got.Partition), Epoch: got.Epoch}
+		require.NoError(t, json.NewEncoder(w).Encode(pdr))
+	}))
+	defer srv.Close()
+	pdr, err := NewBFTRestClient(srv.URL).ShardConfig(context.Background(), 7, 3)
+	require.NoError(t, err)
+	require.EqualValues(t, 3, pdr.Epoch)
+	require.EqualValues(t, 7, pdr.PartitionID)
+	require.EqualValues(t, 3, got.Epoch)
 }

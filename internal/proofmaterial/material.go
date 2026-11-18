@@ -4,11 +4,13 @@
 package proofmaterial
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/unicitynetwork/bft-go-base/types"
 
@@ -175,6 +177,7 @@ func checkTopology(topo types.PartitionViewTopology) error {
 
 // StaticTopology is a fixed trusted topology of the aggregation partition (api.AggregationPartitionID).
 type StaticTopology struct {
+	mu   sync.RWMutex
 	topo types.PartitionViewTopology
 }
 
@@ -201,7 +204,31 @@ func (s *StaticTopology) Topology(partition types.PartitionID) (types.PartitionV
 	if s == nil || partition != api.AggregationPartitionID {
 		return types.PartitionViewTopology{}, false
 	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.topo, true
+}
+
+// Follow moves the pin of one shard from the configuration hash previous to adopted, when the shard's configuration changed live
+// (validator-registry kinds 6 and 8): only a pin that is exactly previous moves, so a pin the operator set to anything else stays. It reports
+// whether the pin moved. Topology returns a snapshot that is never modified afterwards.
+func (s *StaticTopology) Follow(shard types.ShardID, previous, adopted []byte) bool {
+	if s == nil || len(adopted) != ConfHashSize {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := shard.Key()
+	if !bytes.Equal(s.topo.ShardConfHashes[key], previous) {
+		return false
+	}
+	next := make(map[string][]byte, len(s.topo.ShardConfHashes))
+	for k, v := range s.topo.ShardConfHashes {
+		next[k] = v
+	}
+	next[key] = append([]byte(nil), adopted...)
+	s.topo = types.PartitionViewTopology{Scheme: s.topo.Scheme, ShardConfHashes: next}
+	return true
 }
 
 func topologyFor(p TopologyProvider, partition types.PartitionID) (types.PartitionViewTopology, bool) {

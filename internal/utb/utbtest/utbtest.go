@@ -102,9 +102,17 @@ func Certificate(t *testing.T, network types.NetworkID, epoch, rootRound uint64,
 // CertificateWithTR is Certificate committing to the given technical record hash.
 func CertificateWithTR(t *testing.T, network types.NetworkID, epoch, rootRound uint64, signers []Member, trHash []byte) *types.UnicityCertificate {
 	t.Helper()
+	confHash := sha256.Sum256([]byte("shard conf"))
+	return CertificateWithConf(t, network, epoch, rootRound, signers, trHash, confHash[:])
+}
+
+// CertificateWithConf is CertificateWithTR committing to the given shard configuration hash.
+func CertificateWithConf(t *testing.T, network types.NetworkID, epoch, rootRound uint64, signers []Member, trHash, confHashBytes []byte) *types.UnicityCertificate {
+	t.Helper()
 	ir := &types.InputRecord{Version: 1, RoundNumber: 3, Epoch: 0, PreviousHash: []byte{1}, Hash: []byte{2}, SummaryValue: []byte{3}, Timestamp: 1,
 		BlockHash: []byte{4}, SumOfEarnedFees: 0, ETHash: []byte{5}}
-	confHash := sha256.Sum256([]byte("shard conf"))
+	var confHash [32]byte
+	copy(confHash[:], confHashBytes)
 	sTree, err := types.CreateShardTree(types.ShardingScheme{}, []types.ShardTreeInput{{Shard: types.ShardID{}, IR: ir, TRHash: trHash,
 		ShardConfHash: confHash[:]}}, gocrypto.SHA256)
 	require.NoError(t, err)

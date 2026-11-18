@@ -37,6 +37,11 @@ type ucAuthenticator struct {
 	// unchecked, tests only): a certificate that commits to another configuration is not this
 	// shard's.
 	shardConfHash []byte
+	// confs is the history of the shard's configurations this authenticator accepts, oldest first (shardconf.go): a certificate that commits to
+	// any of them is checked against the one that applied to it. shardConfHash is the newest. follow, when set, adopts successors.
+	confMu sync.RWMutex
+	confs  []confEntry
+	follow *shardConfFollower
 
 	mu    sync.Mutex
 	known map[[sha256.Size]byte]struct{}
@@ -104,7 +109,11 @@ func newUCAuthenticator(network types.NetworkID, store TrustBaseStore) *ucAuthen
 
 // withShardConfHash pins the configuration hash the certificates of this shard must commit to.
 func (a *ucAuthenticator) withShardConfHash(h []byte) *ucAuthenticator {
+	a.confMu.Lock()
+	defer a.confMu.Unlock()
 	a.shardConfHash = bytes.Clone(h)
+	a.confs = []confEntry{{hash: bytes.Clone(h)}}
+	a.follow = nil
 	return a
 }
 
@@ -274,7 +283,15 @@ func (o *authOp) verifyUC(uc *types.UnicityCertificate, partition types.Partitio
 	if uc.UnicitySeal.NetworkID != a.network {
 		return fmt.Errorf("unicity seal is of network %d, configured network is %d", uc.UnicitySeal.NetworkID, a.network)
 	}
-	if err := uc.IsValid(partition, shard, a.shardConfHash); err != nil {
+	// the configuration the certificate must commit to: the one of the history it names, else the newest; a hash that is none of them is
+	// judged by the seal first and then followed (adoptConf), never accepted on its own say
+	pin, adopt := a.currentConfHash(), false
+	if a.knownConfHash(uc.ShardConfHash) {
+		pin = uc.ShardConfHash
+	} else if a.follow != nil && pin != nil {
+		pin, adopt = nil, true
+	}
+	if err := uc.IsValid(partition, shard, pin); err != nil {
 		return fmt.Errorf("invalid unicity certificate: %w", err)
 	}
 	shardRoot, err := uc.ShardTreeCertificate.ComputeCertificateHash(uc.InputRecord, uc.TRHash, uc.ShardConfHash, crypto.SHA256)
@@ -288,7 +305,13 @@ func (o *authOp) verifyUC(uc *types.UnicityCertificate, partition types.Partitio
 	if string(root) != string(uc.UnicitySeal.Hash) {
 		return fmt.Errorf("unicity seal hash %X does not match with the root hash of the unicity tree %X", uc.UnicitySeal.Hash, root)
 	}
-	return o.verifySeal(uc.UnicitySeal)
+	if err := o.verifySeal(uc.UnicitySeal); err != nil {
+		return err
+	}
+	if adopt {
+		return a.adoptConf(o.ctx, uc.ShardConfHash)
+	}
+	return nil
 }
 
 // AdmittedTrustBases is the optional lookup of trust bases already admitted to the local
